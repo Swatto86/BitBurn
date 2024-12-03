@@ -1,70 +1,125 @@
-# BitBurn
+# BitBurn - Secure File & Drive Wiping Utility
 
-BitBurn is a secure file and free space wiping utility that implements multiple industry-standard data sanitization algorithms. It provides a user-friendly interface while ensuring thorough data destruction.
+BitBurn is a modern, secure file and drive wiping utility built with Rust and Tauri. It provides multiple industry-standard data erasure algorithms and a user-friendly interface for securely wiping files, folders, and drive free space.
+
+![BitBurn Logo](./src-tauri/icons/128x128.png)
 
 ## Features
 
-### Secure File Wiping
-- Individual file and directory wiping
-- Recursive directory handling
-- Multiple wiping algorithms:
-  - **Basic** (1 pass): Simple zero-fill
-  - **DOD 5220.22-M** (3 passes): Meets US Department of Defense standards
-  - **Gutmann** (35 passes): Peter Gutmann's secure deletion algorithm
-  - **Random** (N passes): User-specified number of random data passes
+- **Multiple Wiping Algorithms:**
+  - NIST 800-88 Clear (1-pass)
+  - NIST 800-88 Purge (3-pass)
+  - Gutmann (35-pass)
+  - Custom Random (1-35 passes)
 
-### Free Space Wiping
-- Securely wipes free space on selected drives
-- Prevents recovery of previously deleted files
-- Uses the same secure algorithms as file wiping
-- Progress tracking and cancellation support
+- **Flexible Wiping Options:**
+  - Single file wiping
+  - Multiple file selection
+  - Folder/directory wiping
+  - Drive free space wiping
+  - Drag and drop support
 
-### Security Features
-- Verification of write operations
-- Protection against accidental system file deletion
-- Clear warnings and confirmations before operations
-- Safe handling of symbolic links
-- Proper cleanup of temporary files
+- **Security Features:**
+  - Secure random number generation
+  - Proper file synchronization
+  - Complete data overwriting
+  - Verification of write operations
 
-### User Interface
-- Modern, intuitive graphical interface
-- Real-time progress tracking
-- System tray integration
-- Operation cancellation support
-- Detailed status reporting
+- **User Interface:**
+  - Modern, intuitive design
+  - Dark/Light theme support
+  - Real-time progress tracking
+  - Detailed operation feedback
+  - System tray integration
+  - Cancellable operations
+
+## Wiping Algorithms
+
+### NIST 800-88 Clear
+- Single pass with zeros
+- Quick and effective for most modern storage devices
+- Suitable for non-sensitive data
+
+### NIST 800-88 Purge
+- Three-pass overwrite:
+  1. All zeros
+  2. All ones
+  3. Random data
+- Recommended for sensitive data
+- Provides good balance of security and speed
+
+### Gutmann Method
+- 35-pass overwrite with specific patterns
+- Designed for magnetic media
+- Includes:
+  - 4 random passes
+  - 27 specific patterns
+  - 4 final random passes
+- Maximum security for legacy storage devices
+
+### Random
+- User-configurable number of passes (1-35)
+- Cryptographically secure random data
+- Customizable security level
+- Suitable for modern storage devices
 
 ## Usage
 
-1. **File/Directory Wiping**:
-   - Select files or directories to wipe
-   - Choose your preferred wiping algorithm
-   - Confirm the operation
-   - Monitor progress and wait for completion
+1. **File/Folder Wiping:**
+   - Click "Wipe Files/Folders" or drag files into the application
+   - Select files/folders to wipe
+   - Choose wiping algorithm
+   - Confirm operation
+   - Monitor progress
 
-2. **Free Space Wiping**:
-   - Select the target drive
-   - Choose your preferred wiping algorithm
-   - Confirm the operation
-   - Monitor progress and wait for completion
+2. **Drive Free Space Wiping:**
+   - Click "Wipe Drive Free Space"
+   - Select target drive
+   - Choose wiping algorithm
+   - Confirm operation
+   - Monitor progress
 
 ## Security Considerations
 
-- BitBurn is designed for secure data destruction on standard storage devices
-- Some storage devices (SSDs, flash drives) may retain data due to wear leveling
-- Administrative privileges may be required for certain operations
-- Always verify critical files are backed up before wiping
-- Consider physical destruction for highly sensitive data
+- Files erased with BitBurn cannot be recovered
+- Operations cannot be undone
+- Administrator privileges may be required for some operations
+- Network paths are not supported for security reasons
+- Symlinks are not followed to prevent security issues
 
-## ⚠️ Warning
+## System Requirements
 
-BitBurn permanently destroys data. Wiped files and free space contents CANNOT be recovered. Use with caution and always verify your selections before confirming operations.
+- Windows 10 or later
+- Administrator privileges for system files/drives
+- Sufficient system resources for large operations
+
+## Technical Details
+
+- Built with Rust and Tauri 2.0
+- Uses cryptographically secure random number generation
+- Implements proper file synchronization
+- Includes comprehensive error handling
+- Features atomic operations for data integrity
+- Includes extensive test coverage
+
+## Development
+
+Built using:
+- Rust (Backend)
+- Tauri 2.0 (Framework)
+- React + TypeScript (Frontend)
+- TailwindCSS (Styling)
+
+## Warning
+
+⚠️ BitBurn is designed to permanently destroy data. Always verify selected files/drives before confirming operations. Wiped data cannot be recovered.
 
 ## License
 
-[MIT License](LICENSE)
+BitBurn is licensed under the [MIT License](LICENSE).
 
 ## Acknowledgments
 
-BitBurn implements several industry-standard data sanitization methods:
-- DOD 5220.22-M (US Department of Defense)
-- Gutmann method (Peter Gutmann)
+- NIST 800-88 Guidelines for Media Sanitization
+- Peter Gutmann's secure deletion paper
+- The Rust and Tauri communities
