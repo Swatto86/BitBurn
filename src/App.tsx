@@ -26,7 +26,7 @@ const MAX_FILE_SIZE = 1024 * 1024 * 1024 * 10; // 10GB warning threshold
 function App() {
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [passes, setPasses] = useState<number>(3);
-  const [algorithm, setAlgorithm] = useState<'Basic' | 'DOD' | 'Gutmann' | 'Random'>('DOD');
+  const [algorithm, setAlgorithm] = useState<'NistClear' | 'NistPurge' | 'Gutmann' | 'Random'>('NistPurge');
   const [isWiping, setIsWiping] = useState(false);
   const [result, setResult] = useState<{ success: boolean; message: string } | null>(null);
   const [theme, setTheme] = useState(() => {
@@ -81,10 +81,10 @@ function App() {
 
   useEffect(() => {
     switch (algorithm) {
-      case 'Basic':
+      case 'NistClear':
         setPasses(1);
         break;
-      case 'DOD':
+      case 'NistPurge':
         setPasses(3);
         break;
       case 'Gutmann':
@@ -132,10 +132,7 @@ function App() {
         const validPaths = paths.filter(path => {
           if (!path.trim()) return false;
           if (path.startsWith('\\\\')) {
-            setResult({
-              success: false,
-              message: "Network paths are not supported"
-            });
+            showResult(false, "Network paths are not supported");
             return false;
           }
           return true;
@@ -162,10 +159,7 @@ function App() {
       }
     } catch (error) {
       console.error('Error selecting files:', error);
-      setResult({
-        success: false,
-        message: `Error selecting files: ${error}`
-      });
+      showResult(false, `Error selecting files: ${error}`);
     }
   };
 
@@ -184,28 +178,21 @@ function App() {
       }
     } catch (error) {
       console.error('Error selecting folders:', error);
+      showResult(false, `Error selecting folders: ${error}`);
     }
   };
 
   const getAlgorithmDescription = () => {
     switch (algorithm) {
-      case 'Basic':
-        return 'Quick single pass with zeros - suitable for non-sensitive data';
-      case 'DOD':
-        return 'US DoD 5220.22-M standard - 3 passes with zeros, ones, and random data';
+      case 'NistClear':
+        return 'NIST 800-88 Clear method - Single pass with zeros (Quick)';
+      case 'NistPurge':
+        return 'NIST 800-88 Purge method - 3 passes with zeros, ones, and random data (Recommended)';
       case 'Gutmann':
-        return 'Peter Gutmann\'s 35-pass algorithm - maximum security for magnetic media';
+        return 'Peter Gutmann\'s 35-pass algorithm - Maximum security for magnetic media (Very slow)';
       case 'Random':
-        return `${passes} passes of cryptographically secure random data`;
+        return `${passes} passes of cryptographically secure random data (Custom)`;
     }
-  };
-
-  const resetUI = () => {
-    setWipeProgress(null);
-    setAbortController(null);
-    setSelectedPaths([]);
-    setOperationMode('initial');
-    setResult(null);
   };
 
   const showResult = (success: boolean, message: string) => {
@@ -218,6 +205,7 @@ function App() {
       setSelectedPaths([]);
       setOperationMode('initial');
       setWipeProgress(null);
+      setAbortController(null);
     }, 3000);
   };
 
@@ -235,7 +223,7 @@ function App() {
       });
 
       if (!confirmed) {
-        showResult(false, "Operation cancelled by user.");
+        showResult(false, "Operation cancelled by user");
         return;
       }
 
@@ -251,16 +239,15 @@ function App() {
       
       setIsWiping(false);
       setAbortController(null);
-      showResult((result as { success: boolean; message: string }).success, 
-                 (result as { success: boolean; message: string }).message);
+      showResult(
+        (result as { success: boolean; message: string }).success,
+        (result as { success: boolean; message: string }).message
+      );
     } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        showResult(false, "Operation cancelled by user.");
-        return;
-      }
+      console.error('Error during wipe operation:', error);
       setIsWiping(false);
       setAbortController(null);
-      showResult(false, `Error: ${error}`);
+      showResult(false, `Error during wipe operation: ${error}`);
     }
   };
 
@@ -279,7 +266,7 @@ function App() {
       });
       
       if (!selected) {
-        showResult(false, "Operation cancelled by user.");
+        showResult(false, "Operation cancelled by user");
         return;
       }
 
@@ -299,7 +286,7 @@ function App() {
       });
       
       if (!confirmed) {
-        showResult(false, "Operation cancelled by user.");
+        showResult(false, "Operation cancelled by user");
         return;
       }
 
@@ -315,16 +302,15 @@ function App() {
 
       setIsWiping(false);
       setAbortController(null);
-      showResult((result as { success: boolean; message: string }).success,
-                 (result as { success: boolean; message: string }).message);
+      showResult(
+        (result as { success: boolean; message: string }).success,
+        (result as { success: boolean; message: string }).message
+      );
     } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        showResult(false, "Operation cancelled by user.");
-        return;
-      }
+      console.error('Error during free space wipe:', error);
       setIsWiping(false);
       setAbortController(null);
-      showResult(false, `Error: ${error}`);
+      showResult(false, `Error during free space wipe: ${error}`);
     }
   };
 
@@ -342,11 +328,17 @@ function App() {
   };
 
   const handleCancel = async () => {
-    if (abortController) {
-      abortController.abort();
-      setAbortController(null);
-      setIsWiping(false);
-      showResult(false, "Operation cancelled by user.");
+    if (isWiping) {
+      try {
+        const window = new Window('main');
+        await window.emit('cancel_operation');
+        setIsWiping(false);
+        setWipeProgress(null);
+        showResult(false, "Operation cancelled by user");
+      } catch (error) {
+        console.error('Error cancelling operation:', error);
+        showResult(false, `Error cancelling operation: ${error}`);
+      }
     }
   };
 
@@ -410,13 +402,13 @@ function App() {
               <select
                 value={algorithm}
                 onChange={(e) => setAlgorithm(e.target.value as typeof algorithm)}
-                className="select select-bordered w-full text-lg text-center"
                 disabled={isWiping}
+                className="select select-bordered w-full"
               >
-                <option value="Basic">Basic (1 pass)</option>
-                <option value="DOD">DoD 5220.22-M (3 pass)</option>
-                <option value="Gutmann">Gutmann (35 pass)</option>
+                <option value="NistPurge">NIST 800-88 Purge (Recommended)</option>
+                <option value="NistClear">NIST 800-88 Clear (Quick)</option>
                 <option value="Random">Random (Custom passes)</option>
+                <option value="Gutmann">Gutmann (35 passes)</option>
               </select>
               <label className="label justify-center">
                 <span className="label-text-alt text-gray-400 text-center">{getAlgorithmDescription()}</span>
@@ -458,13 +450,13 @@ function App() {
           {operationMode === 'initial' && !isWiping && (
             <div className="flex justify-center gap-4 mt-8">
               <button
-                className="btn btn-primary"
+                className="btn bg-[#3730a3] hover:bg-[#312e81] text-white border-none"
                 onClick={() => setOperationMode('files')}
               >
                 Wipe Files/Folders
               </button>
               <button
-                className="btn btn-secondary"
+                className="btn bg-[#f97316] hover:bg-[#ea580c] text-white border-none"
                 onClick={handleWipeFreeSpace}
               >
                 Wipe Drive Free Space
@@ -608,11 +600,13 @@ function App() {
             </div>
           )}
 
-          {/* Result Message */}
+          {/* Result Message - Positioned above warning footer */}
           {result && (
-            <div className={`alert ${result.success ? 'alert-success' : 'alert-error'} mb-12 flex justify-center items-center`}>
-              <div className="text-center">
-                {result.message}
+            <div className="fixed bottom-[60px] left-1/2 transform -translate-x-1/2 z-50 w-auto min-w-[300px] max-w-[90%]">
+              <div className={`alert ${result.success ? 'alert-success' : 'alert-error'} shadow-lg flex justify-center`}>
+                <div className="w-full text-center px-4">
+                  {result.message}
+                </div>
               </div>
             </div>
           )}
