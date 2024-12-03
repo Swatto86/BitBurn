@@ -87,9 +87,9 @@ pub struct WipeResult {
     message: String,
 }
 
-fn secure_wipe_file<F>(path: &Path, passes: u32, algorithm: &WipeAlgorithm, progress_callback: F) -> Result<(), WipeError>
+fn secure_wipe_file<F>(path: &Path, passes: u32, algorithm: &WipeAlgorithm, mut progress_callback: F) -> Result<(), WipeError>
 where
-    F: Fn(WipeProgress),
+    F: FnMut(WipeProgress),
 {
     if path.is_symlink() {
         return Err(WipeError::Io(std::io::Error::new(
@@ -193,36 +193,72 @@ where
         },
         WipeAlgorithm::Gutmann => {
             // Gutmann 35-pass pattern
-            let patterns: &[(u8, bool)] = &[
-                (0x00, false), (0xFF, false), (0x55, false),  // Fixed patterns
-                (0xAA, false), (0x92, false), (0x49, false),  // Fixed patterns
-                (0x24, false), (0x00, true),  (0x11, false),  // Random + Fixed
-                (0x22, false), (0x33, false), (0x44, false),  // Fixed patterns
-                (0x55, false), (0x66, false), (0x77, false),  // Fixed patterns
-                (0x88, false), (0x99, false), (0xAA, false),  // Fixed patterns
-                (0xBB, false), (0xCC, false), (0xDD, false),  // Fixed patterns
-                (0xEE, false), (0xFF, false), (0x92, false),  // Fixed patterns
-                (0x49, false), (0x24, false), (0x6D, false),  // Fixed patterns
-                (0xB6, false), (0xDB, false), (0x00, true),   // Fixed + Random
-                (0x00, true),  (0x00, true),  (0x00, true),   // Random patterns
-                (0x00, true)                                   // Final random
+            // Reference: https://en.wikipedia.org/wiki/Gutmann_method
+            let patterns: &[(Vec<u8>, bool, &str)] = &[
+                // Passes 1-4: Random
+                (vec![0x00], true, "Random data (Pass 1/35)"),
+                (vec![0x00], true, "Random data (Pass 2/35)"),
+                (vec![0x00], true, "Random data (Pass 3/35)"),
+                (vec![0x00], true, "Random data (Pass 4/35)"),
+                
+                // Passes 5-31: Fixed patterns
+                (vec![0x55, 0xAA, 0x55, 0xAA], false, "Pattern 5/35: 0x55 0xAA"),
+                (vec![0xAA, 0x55, 0xAA, 0x55], false, "Pattern 6/35: 0xAA 0x55"),
+                (vec![0x92, 0x49, 0x24], false, "Pattern 7/35: 0x92 0x49 0x24"),
+                (vec![0x49, 0x24, 0x92], false, "Pattern 8/35: 0x49 0x24 0x92"),
+                (vec![0x24, 0x92, 0x49], false, "Pattern 9/35: 0x24 0x92 0x49"),
+                (vec![0x00], false, "Pattern 10/35: 0x00"),
+                (vec![0x11], false, "Pattern 11/35: 0x11"),
+                (vec![0x22], false, "Pattern 12/35: 0x22"),
+                (vec![0x33], false, "Pattern 13/35: 0x33"),
+                (vec![0x44], false, "Pattern 14/35: 0x44"),
+                (vec![0x55], false, "Pattern 15/35: 0x55"),
+                (vec![0x66], false, "Pattern 16/35: 0x66"),
+                (vec![0x77], false, "Pattern 17/35: 0x77"),
+                (vec![0x88], false, "Pattern 18/35: 0x88"),
+                (vec![0x99], false, "Pattern 19/35: 0x99"),
+                (vec![0xAA], false, "Pattern 20/35: 0xAA"),
+                (vec![0xBB], false, "Pattern 21/35: 0xBB"),
+                (vec![0xCC], false, "Pattern 22/35: 0xCC"),
+                (vec![0xDD], false, "Pattern 23/35: 0xDD"),
+                (vec![0xEE], false, "Pattern 24/35: 0xEE"),
+                (vec![0xFF], false, "Pattern 25/35: 0xFF"),
+                (vec![0x92, 0x49, 0x24], false, "Pattern 26/35: 0x92 0x49 0x24"),
+                (vec![0x49, 0x24, 0x92], false, "Pattern 27/35: 0x49 0x24 0x92"),
+                (vec![0x24, 0x92, 0x49], false, "Pattern 28/35: 0x24 0x92 0x49"),
+                (vec![0x6D, 0xB6, 0xDB], false, "Pattern 29/35: 0x6D 0xB6 0xDB"),
+                (vec![0xB6, 0xDB, 0x6D], false, "Pattern 30/35: 0xB6 0xDB 0x6D"),
+                (vec![0xDB, 0x6D, 0xB6], false, "Pattern 31/35: 0xDB 0x6D 0xB6"),
+                
+                // Passes 32-35: Random
+                (vec![0x00], true, "Random data (Pass 32/35)"),
+                (vec![0x00], true, "Random data (Pass 33/35)"),
+                (vec![0x00], true, "Random data (Pass 34/35)"),
+                (vec![0x00], true, "Random data (Pass 35/35)")
             ];
 
-            for (pass, &(pattern, is_random)) in patterns.iter().enumerate() {
+            for (pass, &(ref pattern, is_random, desc)) in patterns.iter().enumerate() {
                 progress.current_pass = (pass + 1) as u32;
-                let desc = format!("Writing pattern {} (Pass {}/35)", pass + 1, pass + 1);
-                progress.update(0, &desc);
+                progress.update(0, desc);
                 progress_callback(progress.clone());
 
                 file.seek(SeekFrom::Start(0)).map_err(WipeError::Io)?;
-                let mut buffer = vec![pattern; BUFFER_SIZE as usize];
+                let mut buffer = vec![0u8; BUFFER_SIZE as usize];
+
                 for chunk_start in (0..file_size).step_by(BUFFER_SIZE as usize) {
-                    let chunk_size = std::cmp::min(BUFFER_SIZE, file_size - chunk_start);
+                    let chunk_size = std::cmp::min(BUFFER_SIZE, file_size - chunk_start) as usize;
+                    
                     if is_random {
-                        rng.fill_bytes(&mut buffer[..chunk_size as usize]);
+                        rng.fill_bytes(&mut buffer[..chunk_size]);
+                    } else {
+                        // Fill the buffer with the repeating pattern
+                        for i in 0..chunk_size {
+                            buffer[i] = pattern[i % pattern.len()];
+                        }
                     }
-                    file.write_all(&buffer[..chunk_size as usize]).map_err(WipeError::Io)?;
-                    progress.update(chunk_start + chunk_size, &desc);
+                    
+                    file.write_all(&buffer[..chunk_size]).map_err(WipeError::Io)?;
+                    progress.update(chunk_start + chunk_size as u64, desc);
                     progress_callback(progress.clone());
                 }
                 file.sync_all().map_err(WipeError::Io)?;
@@ -779,16 +815,61 @@ mod tests {
     #[test]
     fn test_gutmann_wipe() -> io::Result<()> {
         let test_dir = create_test_dir()?;
-        let test_data = [0xAA; 1024];
+        let test_data = [0xAA; 4096];  // Increased size to better test patterns
         let file_path = create_test_file(&test_dir, &test_data)?;
+        
+        // Create a structure to store progress information for verification
+        let mut passes_seen = Vec::new();
         
         // Verify file exists and has correct size
         let metadata = fs::metadata(&file_path)?;
         assert!(metadata.is_file(), "Created path should be a file");
-        assert_eq!(metadata.len(), 1024, "File should be 1024 bytes");
+        assert_eq!(metadata.len(), 4096, "File should be 4096 bytes");
         
-        let result = secure_wipe_file(&file_path, 35, &WipeAlgorithm::Gutmann, |_| {});
-        assert!(result.is_ok(), "Wipe operation should succeed: {:?}", result);
+        let result = secure_wipe_file(&file_path, 35, &WipeAlgorithm::Gutmann, |progress| {
+            // Store progress information for verification
+            passes_seen.push((progress.current_pass, progress.current_pattern.clone()));
+            
+            // Verify pass count is within bounds
+            assert!(progress.current_pass <= 35, "Pass count exceeded 35");
+            assert!(progress.current_pass > 0, "Pass count should start from 1");
+            
+            // Verify progress percentage
+            assert!(progress.percentage >= 0.0 && progress.percentage <= 100.0,
+                "Progress percentage out of bounds: {}", progress.percentage);
+        });
+        
+        // Verify the operation succeeded
+        assert!(result.is_ok(), "Wipe operation failed: {:?}", result);
+        
+        // Verify we saw all 35 passes
+        assert_eq!(passes_seen.iter().map(|(pass, _)| pass).max().unwrap(), &35,
+            "Did not complete all 35 passes");
+            
+        // Verify the sequence of passes
+        let pass_sequence = passes_seen.iter()
+            .map(|(_, pattern)| pattern.as_str())
+            .collect::<Vec<_>>();
+            
+        // Verify first 4 passes are random
+        for i in 0..4 {
+            assert!(pass_sequence.contains(&format!("Random data (Pass {}/35)", i + 1).as_str()),
+                "Missing random pass {}", i + 1);
+        }
+        
+        // Verify some key fixed patterns are present
+        assert!(pass_sequence.contains(&"Pattern 5/35: 0x55 0xAA"),
+            "Missing alternating pattern 0x55 0xAA");
+        assert!(pass_sequence.contains(&"Pattern 7/35: 0x92 0x49 0x24"),
+            "Missing pattern 0x92 0x49 0x24");
+            
+        // Verify last 4 passes are random
+        for i in 32..=35 {
+            assert!(pass_sequence.contains(&format!("Random data (Pass {}/35)", i).as_str()),
+                "Missing random pass {}", i);
+        }
+        
+        // Verify file is deleted after wiping
         assert!(!file_path.exists(), "File should be deleted after wiping");
         
         cleanup_test_dir(&test_dir);
