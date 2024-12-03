@@ -1,0 +1,28 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for the BitBurn secure file eraser",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "dialog:allow-open",
+    "core:tray:allow-new",
+    "core:tray:allow-set-menu",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:window:allow-set-size",
+    "dialog:default",
+    "core:path:default",
+    "core:path:allow-join",
+    "core:path:allow-basename",
+    "core:path:allow-dirname",
+    "core:default",
+    "core:event:default"
+  ],
+  "platforms": [
+    "linux",
+    "macOS",
+    "windows"
+  ]
+}
