@@ -114,6 +114,10 @@ Built using:
 
 ⚠️ BitBurn is designed to permanently destroy data. Always verify selected files/drives before confirming operations. Wiped data cannot be recovered.
 
+## Author
+
+BitBurn is developed by Steve Watson. Visit [swatto.co.uk](https://swatto.co.uk) for more projects and information.
+
 ## License
 
 BitBurn is licensed under the [MIT License](LICENSE).
