@@ -1,0 +1,28 @@
+[package]
+name = "BitBurn"
+version = "1.0.0"
+description = "BitBurn is a secure file and free space wiping utility that implements multiple industry-standard data sanitization algorithms. It provides a user-friendly interface while ensuring thorough data destruction."
+authors = ["Swatto"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+tauri = { version = "2.0", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"
+walkdir = "2.4"
+thiserror = "1.0"
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+opt-level = "z"  # Optimize for size
+lto = true       # Enable Link Time Optimization
+codegen-units = 1 # Reduce codegen units to improve optimization
+panic = "abort"  # Use abort for panics to reduce binary size
+
