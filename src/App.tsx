@@ -396,52 +396,55 @@ function App() {
         <div className="flex-1 w-full flex flex-col space-y-6 mb-12">
           {/* Settings Card - Always visible */}
           <div className="card bg-base-200 p-6 w-full">
-            <div className="form-control mb-6">
-              <label className="label justify-center">
-                <span className="label-text text-lg">Wipe Algorithm</span>
-              </label>
-              <select
-                value={algorithm}
-                onChange={(e) => setAlgorithm(e.target.value as typeof algorithm)}
-                disabled={isWiping}
-                className="select select-bordered w-full"
-              >
-                <option value="NistPurge">NIST 800-88 Purge (Recommended)</option>
-                <option value="NistClear">NIST 800-88 Clear (Quick)</option>
-                <option value="Random">Random (Custom passes)</option>
-                <option value="Gutmann">Gutmann (35 passes)</option>
-              </select>
-              <label className="label justify-center">
-                <span className="label-text-alt text-gray-400 text-center">{getAlgorithmDescription()}</span>
-              </label>
-            </div>
+            <div className="flex flex-col gap-6">
+              {/* Algorithm Selection */}
+              <div className="form-control">
+                <label className="label justify-center">
+                  <span className="label-text text-lg">Wipe Algorithm</span>
+                </label>
+                <select
+                  value={algorithm}
+                  onChange={(e) => setAlgorithm(e.target.value as typeof algorithm)}
+                  className="select select-bordered w-full text-lg text-center"
+                  disabled={isWiping}
+                >
+                  <option value="NistClear">NIST 800-88 Clear (Quick)</option>
+                  <option value="NistPurge">NIST 800-88 Purge (Recommended)</option>
+                  <option value="Gutmann">Gutmann (Very Slow)</option>
+                  <option value="Random">Random Passes (Custom)</option>
+                </select>
+                <div className="text-sm text-gray-400 text-center mt-2">
+                  {getAlgorithmDescription()}
+                </div>
+              </div>
 
-            <div className="form-control">
-              <label className="label justify-center">
-                <span className="label-text text-lg">Number of Passes</span>
-              </label>
-              <div className="flex flex-col items-center gap-2">
-                {algorithm === 'Random' ? (
-                  <input
-                    type="number"
-                    min="1"
-                    max="35"
-                    value={passes}
-                    onChange={handlePassesChange}
-                    className="input input-bordered w-full text-lg text-center"
-                    disabled={isWiping}
-                  />
-                ) : (
-                  <div className="text-3xl font-bold text-center text-primary">
-                    {passes}
-                  </div>
-                )}
-                <div className="text-sm text-gray-400 text-center">
+              <div className="form-control">
+                <label className="label justify-center">
+                  <span className="label-text text-lg">Number of Passes</span>
+                </label>
+                <div className="flex flex-col items-center gap-2">
                   {algorithm === 'Random' ? (
-                    'Choose between 1-35 passes (3-7 recommended)'
+                    <input
+                      type="number"
+                      min="1"
+                      max="35"
+                      value={passes}
+                      onChange={handlePassesChange}
+                      className="input input-bordered w-full text-lg text-center"
+                      disabled={isWiping}
+                    />
                   ) : (
-                    `Fixed at ${passes} ${passes === 1 ? 'pass' : 'passes'} for ${algorithm} algorithm`
+                    <div className="text-3xl font-bold text-center text-primary">
+                      {passes}
+                    </div>
                   )}
+                  <div className="text-sm text-gray-400 text-center">
+                    {algorithm === 'Random' ? (
+                      'Choose between 1-35 passes (3-7 recommended)'
+                    ) : (
+                      `Fixed at ${passes} ${passes === 1 ? 'pass' : 'passes'} for ${algorithm} algorithm`
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
