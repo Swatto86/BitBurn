@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use sysinfo::{DiskExt, System, SystemExt};
 
 #[derive(Debug)]
 pub enum WipeError {
@@ -59,25 +60,31 @@ pub struct WipeProgress {
     current_algorithm: String,
     current_pattern: String,
     percentage: f32,
+    estimated_total_bytes: Option<u64>,
 }
 
 impl WipeProgress {
-    fn new(total_passes: u32, total_bytes: u64, algorithm: &str) -> Self {
+    fn new(total_passes: u32, total_bytes: u64, current_algorithm: &str) -> Self {
         WipeProgress {
             current_pass: 1,
             total_passes,
             bytes_processed: 0,
             total_bytes,
-            current_algorithm: algorithm.to_string(),
+            current_algorithm: current_algorithm.to_string(),
             current_pattern: String::new(),
             percentage: 0.0,
+            estimated_total_bytes: None,
         }
     }
 
     fn update(&mut self, bytes_processed: u64, pattern: &str) {
         self.bytes_processed = bytes_processed;
         self.current_pattern = pattern.to_string();
-        self.percentage = (bytes_processed as f32 / self.total_bytes as f32) * 100.0;
+        if let Some(est_total) = self.estimated_total_bytes {
+            self.percentage = (bytes_processed as f32 / est_total as f32) * 100.0;
+        } else {
+            self.percentage = (bytes_processed as f32 / self.total_bytes as f32) * 100.0;
+        }
     }
 }
 
@@ -160,8 +167,10 @@ where
         }
     );
 
-    // Increase buffer size to 1MB for better performance
-    const BUFFER_SIZE: u64 = 1024 * 1024;
+    // Increase buffer size to 1MB for better performance and smooth updates
+    const BUFFER_SIZE: u64 = 1024 * 1024; // 1MB
+    let mut last_progress_update = std::time::Instant::now();
+    let progress_update_interval = std::time::Duration::from_millis(16); // ~60 fps
 
     match algorithm {
         WipeAlgorithm::NistClear => {
@@ -174,8 +183,19 @@ where
                 check_cancelled()?;
                 let chunk_size = std::cmp::min(BUFFER_SIZE, file_size - chunk_start);
                 file.write_all(&buffer[..chunk_size as usize]).map_err(WipeError::Io)?;
-                progress.update(chunk_start + chunk_size, "NIST 800-88 Clear - Writing zeros");
-                progress_callback(progress.clone());
+
+                // Update progress at most every 16ms for smooth animation
+                if last_progress_update.elapsed() >= progress_update_interval {
+                    progress.update(
+                        chunk_start + chunk_size,
+                        &format!("NIST 800-88 Clear - Writing zeros ({:.2} MB / {:.2} MB)",
+                            (chunk_start + chunk_size) as f64 / 1024.0 / 1024.0,
+                            file_size as f64 / 1024.0 / 1024.0
+                        )
+                    );
+                    progress_callback(progress.clone());
+                    last_progress_update = std::time::Instant::now();
+                }
             }
             file.sync_all().map_err(WipeError::Io)?;
             
@@ -187,15 +207,16 @@ where
         WipeAlgorithm::NistPurge => {
             // NIST 800-88 Purge: Three-pass overwrite
             let patterns = [
-                (0x00, false, "NIST 800-88 Purge - Writing zeros (Pass 1/3)"),
-                (0xFF, false, "NIST 800-88 Purge - Writing ones (Pass 2/3)"),
-                (0x00, true, "NIST 800-88 Purge - Writing random (Pass 3/3)")
+                (0x00, false, "zeros"),
+                (0xFF, false, "ones"),
+                (0x00, true, "random data")
             ];
 
-            for (pass, &(pattern, is_random, desc)) in patterns.iter().enumerate() {
+            for (pass, &(pattern, is_random, pattern_type)) in patterns.iter().enumerate() {
                 check_cancelled()?;
                 progress.current_pass = (pass + 1) as u32;
-                progress.update(0, desc);
+                let desc = format!("NIST 800-88 Purge - Writing {} (Pass {}/3)", pattern_type, pass + 1);
+                progress.update(0, &desc);
                 progress_callback(progress.clone());
 
                 file.seek(SeekFrom::Start(0)).map_err(WipeError::Io)?;
@@ -208,8 +229,21 @@ where
                         rng.fill_bytes(&mut buffer[..chunk_size as usize]);
                     }
                     file.write_all(&buffer[..chunk_size as usize]).map_err(WipeError::Io)?;
-                    progress.update(chunk_start + chunk_size, desc);
-                    progress_callback(progress.clone());
+
+                    // Update progress at most every 16ms for smooth animation
+                    if last_progress_update.elapsed() >= progress_update_interval {
+                        progress.update(
+                            chunk_start + chunk_size,
+                            &format!("NIST 800-88 Purge - Writing {} (Pass {}/3) - {:.2} MB / {:.2} MB",
+                                pattern_type,
+                                pass + 1,
+                                (chunk_start + chunk_size) as f64 / 1024.0 / 1024.0,
+                                file_size as f64 / 1024.0 / 1024.0
+                            )
+                        );
+                        progress_callback(progress.clone());
+                        last_progress_update = std::time::Instant::now();
+                    }
                 }
                 file.sync_all().map_err(WipeError::Io)?;
             }
@@ -288,8 +322,20 @@ where
                     }
                     
                     file.write_all(&buffer[..chunk_size]).map_err(WipeError::Io)?;
-                    progress.update(chunk_start + chunk_size as u64, desc);
-                    progress_callback(progress.clone());
+
+                    // Update progress at most every 16ms for smooth animation
+                    if last_progress_update.elapsed() >= progress_update_interval {
+                        progress.update(
+                            chunk_start + chunk_size as u64,
+                            &format!("{} - {:.2} MB / {:.2} MB",
+                                desc,
+                                (chunk_start + chunk_size as u64) as f64 / 1024.0 / 1024.0,
+                                file_size as f64 / 1024.0 / 1024.0
+                            )
+                        );
+                        progress_callback(progress.clone());
+                        last_progress_update = std::time::Instant::now();
+                    }
                 }
                 file.sync_all().map_err(WipeError::Io)?;
             }
@@ -314,8 +360,21 @@ where
                     let chunk_size = std::cmp::min(BUFFER_SIZE, file_size - chunk_start);
                     rng.fill_bytes(&mut buffer[..chunk_size as usize]);
                     file.write_all(&buffer[..chunk_size as usize]).map_err(WipeError::Io)?;
-                    progress.update(chunk_start + chunk_size, &desc);
-                    progress_callback(progress.clone());
+
+                    // Update progress at most every 16ms for smooth animation
+                    if last_progress_update.elapsed() >= progress_update_interval {
+                        progress.update(
+                            chunk_start + chunk_size,
+                            &format!("Writing random data (Pass {}/{}) - {:.2} MB / {:.2} MB",
+                                pass,
+                                passes,
+                                (chunk_start + chunk_size) as f64 / 1024.0 / 1024.0,
+                                file_size as f64 / 1024.0 / 1024.0
+                            )
+                        );
+                        progress_callback(progress.clone());
+                        last_progress_update = std::time::Instant::now();
+                    }
                 }
                 file.sync_all().map_err(WipeError::Io)?;
             }
@@ -442,6 +501,18 @@ async fn execute_free_space_wipe<R: Runtime>(
         });
     }
 
+    // Initialize system info
+    let mut sys = System::new_all();
+    sys.refresh_disks_list();
+    
+    // Find the disk that contains our path
+    let disk_info = sys.disks().iter()
+        .find(|disk| path.starts_with(disk.mount_point()))
+        .ok_or_else(|| "Could not find disk information".to_string())?;
+    
+    let available_space = disk_info.available_space();
+    println!("Available space on drive: {} bytes", available_space);
+
     let window_clone = window.clone();
     let cancelled_clone = cancelled.clone();
     let progress_callback = move |progress| {
@@ -450,16 +521,8 @@ async fn execute_free_space_wipe<R: Runtime>(
         }
     };
 
-    // Initialize progress with correct total passes
-    let total_passes = match algorithm {
-        WipeAlgorithm::NistClear => 1,
-        WipeAlgorithm::NistPurge => 3,
-        WipeAlgorithm::Gutmann => 35,
-        WipeAlgorithm::Random => passes,
-    };
-
     let mut progress = WipeProgress::new(
-        total_passes,
+        passes,
         0,
         match algorithm {
             WipeAlgorithm::NistClear => "NIST 800-88 Clear",
@@ -468,8 +531,15 @@ async fn execute_free_space_wipe<R: Runtime>(
             WipeAlgorithm::Random => "Random",
         }
     );
+    
+    // Set the estimated total bytes to the available space
+    progress.estimated_total_bytes = Some(available_space);
 
-    // Create temporary file
+    // Create and fill temporary file
+    println!("Creating temporary file");
+    progress.update(0, "Filling drive space");
+    progress_callback(progress.clone());
+
     let temp_file_path = path.join(".temp_wipe_file");
     
     // Check for existing temp file
@@ -485,11 +555,6 @@ async fn execute_free_space_wipe<R: Runtime>(
         }
     }
 
-    // Create and fill temporary file
-    println!("Creating temporary file");
-    progress.update(0, "Filling drive space");
-    progress_callback(progress.clone());
-
     let mut file = match OpenOptions::new()
         .write(true)
         .create(true)
@@ -504,10 +569,12 @@ async fn execute_free_space_wipe<R: Runtime>(
     };
 
     // Write data in chunks until disk is full
-    let chunk_size = 1024 * 1024 * 10; // 10MB chunks
+    let chunk_size = 1024 * 1024; // 1MB chunks
     let mut buffer = vec![0u8; chunk_size];
     let mut rng = rand::thread_rng();
     let mut total_written = 0u64;
+    let mut last_refresh = std::time::Instant::now();
+    let mut last_space_used = 0u64;
 
     loop {
         // Check for cancellation
@@ -520,15 +587,26 @@ async fn execute_free_space_wipe<R: Runtime>(
             });
         }
 
+        // Refresh disk info every 100ms to avoid excessive system calls
+        if last_refresh.elapsed() >= std::time::Duration::from_millis(100) {
+            sys.refresh_disks_list();
+            if let Some(disk) = sys.disks().iter().find(|disk| path.starts_with(disk.mount_point())) {
+                let current_available = disk.available_space();
+                last_space_used = available_space - current_available;
+            }
+            last_refresh = std::time::Instant::now();
+        }
+
         rng.fill_bytes(&mut buffer);
         match file.write_all(&buffer) {
             Ok(_) => {
                 total_written += chunk_size as u64;
-                progress.total_bytes = total_written;
-                progress.update(total_written, "Filling drive space");
+                
+                // Update progress after every chunk write
+                progress.update(last_space_used, &format!("Filling drive space ({} MB written)", total_written / 1024 / 1024));
                 progress_callback(progress.clone());
                 
-                if total_written % (100 * chunk_size as u64) == 0 {
+                if total_written % (10 * chunk_size as u64) == 0 {
                     if let Err(_) = file.sync_all() {
                         break;
                     }
@@ -538,6 +616,14 @@ async fn execute_free_space_wipe<R: Runtime>(
                 if e.kind() == io::ErrorKind::StorageFull || 
                    e.kind() == io::ErrorKind::OutOfMemory ||
                    e.kind() == io::ErrorKind::WriteZero {
+                    // One final refresh of disk info
+                    sys.refresh_disks_list();
+                    if let Some(disk) = sys.disks().iter().find(|disk| path.starts_with(disk.mount_point())) {
+                        let current_available = disk.available_space();
+                        let space_used = available_space - current_available;
+                        progress.update(space_used, "Drive space filled");
+                        progress_callback(progress.clone());
+                    }
                     break;
                 }
                 let _ = fs::remove_file(&temp_file_path);
@@ -956,9 +1042,14 @@ mod tests {
         
         let mut progress_patterns_seen = Vec::new();
         let result = secure_wipe_file(&file_path, 35, &WipeAlgorithm::Gutmann, |progress| {
-            // Only store unique patterns to avoid counting progress updates within the same pass
-            if !progress_patterns_seen.contains(&progress.current_pattern) {
-                progress_patterns_seen.push(progress.current_pattern.clone());
+            // Only store the base pattern without MB information
+            let base_pattern = progress.current_pattern
+                .split(" - ")
+                .next()
+                .unwrap_or(&progress.current_pattern)
+                .to_string();
+            if !progress_patterns_seen.contains(&base_pattern) {
+                progress_patterns_seen.push(base_pattern);
             }
         });
         
@@ -968,6 +1059,7 @@ mod tests {
         // Verify we saw all 35 passes
         let unique_passes = progress_patterns_seen.iter()
             .filter(|p| p.contains("Pass") || p.contains("Pattern"))
+            .filter(|p| !p.contains("Finalizing"))
             .count();
         assert_eq!(unique_passes, 35, "Did not see all 35 passes");
             
@@ -1011,9 +1103,14 @@ mod tests {
         let passes = 5;
         let mut progress_patterns_seen = Vec::new();
         let result = secure_wipe_file(&file_path, passes, &WipeAlgorithm::Random, |progress| {
-            // Only store unique patterns to avoid counting progress updates within the same pass
-            if !progress_patterns_seen.contains(&progress.current_pattern) {
-                progress_patterns_seen.push(progress.current_pattern.clone());
+            // Only store the base pattern without MB information
+            let base_pattern = progress.current_pattern
+                .split(" - ")
+                .next()
+                .unwrap_or(&progress.current_pattern)
+                .to_string();
+            if !progress_patterns_seen.contains(&base_pattern) {
+                progress_patterns_seen.push(base_pattern);
             }
         });
         
@@ -1023,12 +1120,14 @@ mod tests {
         // Verify we saw all passes
         let unique_passes = progress_patterns_seen.iter()
             .filter(|p| p.contains("Pass"))
+            .filter(|p| !p.contains("Finalizing"))
             .count();
         assert_eq!(unique_passes, passes as usize, "Did not see all passes");
         
         // Verify pass numbering
         for i in 1..=passes {
-            assert!(progress_patterns_seen.iter().any(|p| p.contains(&format!("Pass {}/{}", i, passes))),
+            let pass_pattern = format!("Writing random data (Pass {}/{})", i, passes);
+            assert!(progress_patterns_seen.iter().any(|p| p == &pass_pattern),
                 "Missing pass {}", i);
         }
         

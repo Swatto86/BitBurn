@@ -3,6 +3,7 @@ name = "BitBurn"
 version = "1.0.0"
 description = "BitBurn is a secure file and free space wiping utility that implements multiple industry-standard data sanitization algorithms. It provides a user-friendly interface while ensuring thorough data destruction."
 authors = ["Swatto"]
+license = "MIT"
 edition = "2021"
 
 [build-dependencies]
@@ -16,6 +17,7 @@ serde_json = "1.0"
 rand = "0.8"
 walkdir = "2.4"
 thiserror = "1.0"
+sysinfo = "0.29.10"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
