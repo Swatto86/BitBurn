@@ -19,6 +19,7 @@ interface WipeProgress {
   current_algorithm: string;
   current_pattern: string;
   percentage: number;
+  estimated_total_bytes?: number;
 }
 
 const MAX_FILE_SIZE = 1024 * 1024 * 1024 * 10; // 10GB warning threshold
@@ -562,7 +563,7 @@ function App() {
                 <div 
                   className="bg-primary h-full rounded-lg transition-all duration-300 ease-linear"
                   style={{ 
-                    width: `${wipeProgress.total_bytes === 0 ? 0 : Math.min(wipeProgress.percentage, 99.9)}%`
+                    width: `${Math.min(wipeProgress.percentage, 100)}%`
                   }}
                 />
               </div>
@@ -570,18 +571,18 @@ function App() {
               <div className="flex justify-between items-center text-sm mb-2">
                 <span className="text-gray-300">{wipeProgress.current_pattern}</span>
                 <span className="text-gray-300 font-medium">
-                  {wipeProgress.total_bytes === 0 ? '0%' : `${Math.min(Math.round(wipeProgress.percentage), 99.9)}%`}
+                  {`${Math.min(Math.round(wipeProgress.percentage), 100)}%`}
                 </span>
               </div>
               
-              {wipeProgress.total_bytes > 0 && (
+              {(wipeProgress.total_bytes > 0 || wipeProgress.estimated_total_bytes) && (
                 <div className="text-center text-sm mb-4">
                   <span className="text-gray-300">
                     {(wipeProgress.bytes_processed / (1024 * 1024)).toFixed(2)} MB
                   </span>
                   <span className="text-gray-500"> of </span>
                   <span className="text-gray-300">
-                    {(wipeProgress.total_bytes / (1024 * 1024)).toFixed(2)} MB
+                    {((wipeProgress.estimated_total_bytes || wipeProgress.total_bytes) / (1024 * 1024)).toFixed(2)} MB
                   </span>
                   <span className="text-gray-500"> processed</span>
                 </div>
