@@ -22,6 +22,17 @@ interface WipeProgress {
   estimated_total_bytes?: number;
 }
 
+interface ContextWipePayload {
+  paths: string[];
+  invalid: string[];
+  source: string;
+}
+
+interface ContextMenuStatus {
+  enabled: boolean;
+  message: string;
+}
+
 const MAX_FILE_SIZE = 1024 * 1024 * 1024 * 10; // 10GB warning threshold
 
 function App() {
@@ -45,10 +56,49 @@ function App() {
   >("initial");
   const [abortController, setAbortController] =
     useState<AbortController | null>(null);
+  const [isContextMode, setIsContextMode] = useState(false);
+  const [contextInvalidPaths, setContextInvalidPaths] = useState<string[]>([]);
+  const [isWindows, setIsWindows] = useState(false);
+  const [contextMenuEnabled, setContextMenuEnabled] =
+    useState<boolean | null>(null);
+  const [contextMenuMessage, setContextMenuMessage] =
+    useState<string | null>(null);
+  const [contextMenuBusy, setContextMenuBusy] = useState(false);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, []);
+
+  useEffect(() => {
+    const detectPlatform = async () => {
+      const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+      const hasTauriIpc =
+        typeof window !== "undefined" && "__TAURI_IPC__" in window;
+
+      if (hasTauriIpc) {
+        try {
+          const info = (await invoke("platform_info")) as {
+            is_windows?: boolean;
+          };
+          if (typeof info?.is_windows === "boolean") {
+            setIsWindows(info.is_windows);
+            return;
+          }
+        } catch (error) {
+          console.error("Unable to detect platform:", error);
+        }
+      }
+
+      setIsWindows(ua.toLowerCase().includes("windows"));
+    };
+
+    detectPlatform();
+  }, []);
+
+  useEffect(() => {
+    if (!isWindows) return;
+    refreshContextMenuStatus();
+  }, [isWindows]);
 
   const toggleTheme = () => {
     const newTheme = theme === "dark" ? "light" : "dark";
@@ -133,6 +183,52 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let unlistenContext: (() => void) | undefined;
+
+    const setupContextListener = async () => {
+      try {
+        const window = new Window("main");
+        unlistenContext = await window.listen<ContextWipePayload>(
+          "context_wipe_request",
+          (event: Event<ContextWipePayload>) => {
+            const payload = event.payload;
+            const unique = Array.from(new Set(payload.paths || []));
+
+            if (unique.length === 0) {
+              setContextInvalidPaths(payload.invalid || []);
+              setIsContextMode(false);
+              setResult({
+                success: false,
+                message:
+                  "No valid local files or folders were provided from the context menu",
+              });
+              setTimeout(() => setResult(null), 3000);
+              return;
+            }
+
+            setSelectedPaths(unique);
+            setContextInvalidPaths(payload.invalid || []);
+            setOperationMode("files");
+            setIsContextMode(true);
+            setIsWiping(false);
+            setResult(null);
+          },
+        );
+      } catch (error) {
+        console.error("Error setting up context listener:", error);
+      }
+    };
+
+    setupContextListener();
+
+    return () => {
+      if (unlistenContext) {
+        unlistenContext();
+      }
+    };
+  }, []);
+
   const handleFileSelect = async () => {
     try {
       const selected = await open({
@@ -195,7 +291,32 @@ function App() {
 
       if (selected) {
         const paths = Array.isArray(selected) ? selected : [selected];
-        setSelectedPaths((prev) => [...prev, ...paths]);
+
+        let hadNetworkPath = false;
+        const validPaths = paths
+          .map((path) => path.trim())
+          .filter((path) => {
+            if (!path) return false;
+            if (path.startsWith("\\\\")) {
+              hadNetworkPath = true;
+              return false;
+            }
+            return true;
+          });
+
+        if (validPaths.length === 0) {
+          showResult(
+            false,
+            hadNetworkPath
+              ? "Network paths are not supported"
+              : "No valid local folders were selected",
+          );
+          return;
+        }
+
+        setSelectedPaths((prev) => [
+          ...new Set([...prev, ...validPaths]),
+        ]);
         setOperationMode("files");
       }
     } catch (error) {
@@ -228,13 +349,33 @@ function App() {
       setOperationMode("initial");
       setWipeProgress(null);
       setAbortController(null);
+      setIsContextMode(false);
+      setContextInvalidPaths([]);
     }, 3000);
+  };
+
+  const flashMessage = (success: boolean, message: string) => {
+    setResult({ success, message });
+    setTimeout(() => setResult(null), 2500);
+  };
+
+  const refreshContextMenuStatus = async () => {
+    if (!isWindows) return;
+    try {
+      const status = (await invoke("get_context_menu_status")) as ContextMenuStatus;
+      setContextMenuEnabled(status.enabled);
+      setContextMenuMessage(status.message);
+    } catch (error) {
+      console.error("Unable to fetch context menu status:", error);
+      setContextMenuMessage("Unable to query context menu status");
+    }
   };
 
   const handleWipe = async () => {
     if (selectedPaths.length === 0) return;
 
     try {
+      setIsContextMode(false);
       setResult(null);
       setWipeProgress(null);
 
@@ -383,6 +524,26 @@ function App() {
     }
   };
 
+  const toggleContextMenu = async (enable: boolean) => {
+    if (!isWindows) return;
+    setContextMenuBusy(true);
+    try {
+      const result = (await invoke(
+        enable ? "register_context_menu" : "unregister_context_menu",
+      )) as { success?: boolean; message?: string };
+      await refreshContextMenuStatus();
+      flashMessage(
+        Boolean(result?.success),
+        result?.message || "Context menu updated",
+      );
+    } catch (error) {
+      console.error("Context menu update failed:", error);
+      flashMessage(false, `Context menu update failed: ${error}`);
+    } finally {
+      setContextMenuBusy(false);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-base-100 text-base-content">
       <div className="container mx-auto px-4 py-8 flex flex-col items-center max-h-screen overflow-hidden">
@@ -498,6 +659,34 @@ function App() {
               </div>
             </div>
           </div>
+
+          {isWindows && (
+            <div className="card bg-base-200 p-4 w-full">
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="font-semibold text-lg">
+                      Windows Explorer Context Menu
+                    </h3>
+                    <p className="text-sm text-gray-400">
+                      Adds BitBurn -&gt; Shred -&gt; Choose Shred Algorithm to the
+                      file/folder right-click menu.
+                    </p>
+                  </div>
+                  <button
+                    className="btn btn-outline btn-sm"
+                    disabled={contextMenuBusy || contextMenuEnabled === null}
+                    onClick={() => toggleContextMenu(!contextMenuEnabled)}
+                  >
+                    {contextMenuEnabled ? "Remove" : "Add"} Context Menu
+                  </button>
+                </div>
+                {contextMenuMessage && (
+                  <p className="text-sm text-gray-400">{contextMenuMessage}</p>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Operation Selection - Only visible in initial mode */}
           {operationMode === "initial" && !isWiping && (
@@ -616,6 +805,68 @@ function App() {
                 </div>
               </div>
             )}
+
+          {isContextMode && !isWiping && (
+            <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60 px-4">
+              <div className="card bg-base-200 w-full max-w-2xl shadow-2xl">
+                <div className="card-body space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-xl font-semibold">Context Menu Shred</h3>
+                    <button
+                      className="btn btn-ghost btn-sm"
+                      onClick={() => {
+                        setIsContextMode(false);
+                        setContextInvalidPaths([]);
+                      }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  <p className="text-gray-300">
+                    Ready to shred {selectedPaths.length} {selectedPaths.length === 1 ? "item" : "items"}
+                    {contextInvalidPaths.length > 0 ? " (some items were skipped)" : ""}.
+                  </p>
+
+                  {contextInvalidPaths.length > 0 && (
+                    <div className="alert alert-warning text-sm">
+                      <div className="font-semibold">Skipped items</div>
+                      <ul className="list-disc list-inside space-y-1">
+                        {contextInvalidPaths.map((issue, idx) => (
+                          <li key={idx} className="break-all">{issue}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  <div className="max-h-40 overflow-y-auto bg-base-300/40 rounded p-3">
+                    {selectedPaths.map((path, idx) => (
+                      <div key={idx} className="text-sm text-gray-200 break-all">
+                        {path}
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="flex justify-end gap-3 pt-2">
+                    <button
+                      className="btn btn-ghost"
+                      onClick={() => {
+                        setIsContextMode(false);
+                        setContextInvalidPaths([]);
+                        setSelectedPaths([]);
+                        setOperationMode("initial");
+                      }}
+                    >
+                      Cancel
+                    </button>
+                    <button className="btn btn-error" onClick={handleWipe}>
+                      Shred Now
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Progress Display */}
           {isWiping && wipeProgress && (

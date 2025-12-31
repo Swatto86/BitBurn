@@ -12,6 +12,10 @@ BitBurn is a modern, secure file and drive wiping utility built with Rust and Ta
   - Gutmann (35-pass)
   - Custom Random (1-35 passes)
 
+- **Explorer Context Menu (Windows):**
+  - Optional BitBurn -> Shred -> Choose Shred Algorithm entry on file/folder right-click
+  - Multi-selection support with path validation
+
 - **Flexible Wiping Options:**
   - Single file wiping
   - Multiple file selection
@@ -64,6 +68,11 @@ BitBurn is a modern, secure file and drive wiping utility built with Rust and Ta
 - Suitable for modern storage devices
 
 ## Usage
+
+### Windows Explorer Context Menu
+- On Windows, open BitBurn and use the "Windows Explorer Context Menu" card to add the shell entry.
+- Right-click any file or folder (multi-select supported) and choose **BitBurn -> Shred -> Choose Shred Algorithm**.
+- A quick modal appears in BitBurn to pick the algorithm and confirm.
 
 1. **File/Folder Wiping:**
    - Click "Wipe Files/Folders" or drag files into the application

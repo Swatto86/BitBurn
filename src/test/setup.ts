@@ -7,6 +7,9 @@ afterEach(() => {
   cleanup();
 });
 
+// Enable React act() environment for Vitest
+globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+
 // Mock localStorage
 const localStorageMock = {
   getItem: vi.fn(),
