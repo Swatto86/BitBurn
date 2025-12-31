@@ -488,6 +488,24 @@ describe("BitBurn UI Tests", () => {
         expect(screen.getByText(/C:\\test\\folder/)).toBeInTheDocument();
       });
     });
+
+    it("should reject UNC network folder selections", async () => {
+      mockOpen.mockResolvedValue(["\\\\server\\share"] as any);
+
+      render(<App />);
+
+      const filesButton = screen.getByText("Wipe Files/Folders");
+      await userEvent.click(filesButton);
+
+      const selectFoldersButton = screen.getByText("Select Folders");
+      await userEvent.click(selectFoldersButton);
+
+      await waitFor(() => {
+        expect(
+          screen.getByText(/Network paths are not supported/i),
+        ).toBeInTheDocument();
+      });
+    });
   });
 
   describe("Drag and Drop", () => {
@@ -642,7 +660,9 @@ describe("BitBurn UI Tests", () => {
       expect(select).toBeDisabled();
 
       // Clean up
-      wipeResolver({ success: true, message: "Done" });
+      await waitFor(() => {
+        wipeResolver({ success: true, message: "Done" });
+      });
     });
 
     it("should show cancel button during wipe", async () => {
@@ -695,17 +715,19 @@ describe("BitBurn UI Tests", () => {
 
       // Trigger progress to display cancel button if callback is set
       if (progressCallback) {
-        progressCallback({
-          payload: {
-            current_pass: 1,
-            total_passes: 3,
-            bytes_processed: 500,
-            total_bytes: 1000,
-            current_algorithm: "NistPurge",
-            current_pattern: "zeros",
-            percentage: 50,
-            estimated_total_bytes: 1000,
-          },
+        await waitFor(() => {
+          progressCallback({
+            payload: {
+              current_pass: 1,
+              total_passes: 3,
+              bytes_processed: 500,
+              total_bytes: 1000,
+              current_algorithm: "NistPurge",
+              current_pattern: "zeros",
+              percentage: 50,
+              estimated_total_bytes: 1000,
+            },
+          });
         });
 
         await waitFor(() => {
@@ -714,7 +736,9 @@ describe("BitBurn UI Tests", () => {
       }
 
       // Resolve the wipe to clean up
-      wipeResolver({ success: true, message: "Completed" });
+      await waitFor(() => {
+        wipeResolver({ success: true, message: "Completed" });
+      });
     });
   });
 
@@ -780,17 +804,19 @@ describe("BitBurn UI Tests", () => {
 
       // Simulate progress event if callback is set
       if (progressCallback) {
-        progressCallback({
-          payload: {
-            current_pass: 1,
-            total_passes: 3,
-            bytes_processed: 500,
-            total_bytes: 1000,
-            current_algorithm: "NistPurge",
-            current_pattern: "zeros",
-            percentage: 50,
-            estimated_total_bytes: 1000,
-          },
+        await waitFor(() => {
+          progressCallback({
+            payload: {
+              current_pass: 1,
+              total_passes: 3,
+              bytes_processed: 500,
+              total_bytes: 1000,
+              current_algorithm: "NistPurge",
+              current_pattern: "zeros",
+              percentage: 50,
+              estimated_total_bytes: 1000,
+            },
+          });
         });
 
         // Wait for progress to be displayed
@@ -800,7 +826,9 @@ describe("BitBurn UI Tests", () => {
       }
 
       // Clean up
-      wipeResolver({ success: true, message: "Done" });
+      await waitFor(() => {
+        wipeResolver({ success: true, message: "Done" });
+      });
     });
   });
 
@@ -968,17 +996,19 @@ describe("BitBurn UI Tests", () => {
 
       // Trigger progress to display cancel button if callback is set
       if (progressCallback) {
-        progressCallback({
-          payload: {
-            current_pass: 1,
-            total_passes: 3,
-            bytes_processed: 500,
-            total_bytes: 1000,
-            current_algorithm: "NistPurge",
-            current_pattern: "zeros",
-            percentage: 50,
-            estimated_total_bytes: 1000,
-          },
+        await waitFor(() => {
+          progressCallback({
+            payload: {
+              current_pass: 1,
+              total_passes: 3,
+              bytes_processed: 500,
+              total_bytes: 1000,
+              current_algorithm: "NistPurge",
+              current_pattern: "zeros",
+              percentage: 50,
+              estimated_total_bytes: 1000,
+            },
+          });
         });
 
         await waitFor(() => {
@@ -987,7 +1017,9 @@ describe("BitBurn UI Tests", () => {
       }
 
       // Clean up
-      wipeResolver({ success: true, message: "Done" });
+      await waitFor(() => {
+        wipeResolver({ success: true, message: "Done" });
+      });
     });
   });
 
@@ -1042,6 +1074,56 @@ describe("BitBurn UI Tests", () => {
         expect(screen.getByText(/C:\\test\\file2.txt/)).toBeInTheDocument();
         expect(screen.getByText(/C:\\test\\file3.txt/)).toBeInTheDocument();
       });
+    });
+  });
+
+  describe("Platform gating", () => {
+    it("shows context controls when backend reports Windows", async () => {
+      Object.defineProperty(window as any, "__TAURI_IPC__", {
+        value: true,
+        configurable: true,
+      });
+
+      mockInvoke.mockResolvedValueOnce({ is_windows: true });
+      mockInvoke.mockResolvedValueOnce({
+        enabled: true,
+        message: "Context menu is registered",
+      });
+
+      render(<App />);
+
+      await waitFor(() => {
+        expect(
+          screen.getByText("Windows Explorer Context Menu"),
+        ).toBeInTheDocument();
+      });
+
+      expect(
+        screen.getByText(/Context menu is registered/i),
+      ).toBeInTheDocument();
+
+      delete (window as any).__TAURI_IPC__;
+    });
+
+    it("hides context controls when backend reports non-Windows", async () => {
+      Object.defineProperty(window as any, "__TAURI_IPC__", {
+        value: true,
+        configurable: true,
+      });
+
+      mockInvoke.mockResolvedValueOnce({ is_windows: false });
+
+      render(<App />);
+
+      await waitFor(() => {
+        expect(mockInvoke).toHaveBeenCalledWith("platform_info");
+      });
+
+      expect(
+        screen.queryByText("Windows Explorer Context Menu"),
+      ).not.toBeInTheDocument();
+
+      delete (window as any).__TAURI_IPC__;
     });
   });
 });

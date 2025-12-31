@@ -3,19 +3,29 @@
 
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WindowEvent, Runtime, Emitter, Listener,
+    Emitter, Listener, Manager, Runtime, WindowEvent,
 };
 use walkdir::WalkDir;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use sysinfo::{DiskExt, System, SystemExt};
+mod platform;
+
+use platform::context_menu::{
+    get_context_menu_status,
+    handle_context_invocation,
+    process_cli_side_effects,
+    register_context_menu,
+    unregister_context_menu,
+};
 
 #[derive(Debug)]
 pub enum WipeError {
@@ -93,6 +103,26 @@ pub struct WipeResult {
     success: bool,
     message: String,
 }
+
+#[derive(Serialize)]
+pub struct ContextMenuStatus {
+    enabled: bool,
+    message: String,
+}
+
+pub(crate) fn log_event(event: &str, fields: serde_json::Value) {
+    if let Ok(serialized) = serde_json::to_string(&json!({ "event": event, "fields": fields })) {
+        println!("{}", serialized);
+    }
+}
+
+/// Platform info reported to the frontend for capability gating.
+#[derive(Debug, Serialize, Clone)]
+pub struct PlatformInfo {
+    is_windows: bool,
+    os: String,
+}
+
 
 fn secure_wipe_file<F>(path: &Path, passes: u32, algorithm: &WipeAlgorithm, mut progress_callback: F) -> Result<(), WipeError>
 where
@@ -416,30 +446,37 @@ fn validate_drive_path_internal(path: &Path) -> Result<(), DriveValidationError>
     }
 
     // Check if it's a drive root (e.g., "C:\")
-    if !path.to_string_lossy().matches('\\').count() == 1 {
+    if path.to_string_lossy().matches('\\').count() != 1 {
         return Err(DriveValidationError::NotDriveRoot);
     }
 
     Ok(())
 }
 
+/// Validate that the provided path is an existing drive root (e.g., "C:\").
 #[tauri::command]
 async fn validate_drive_path(path: String) -> Result<WipeResult, String> {
-    println!("Validating drive path: {}", path);
     let path = Path::new(&path);
     
     match validate_drive_path_internal(path) {
-        Ok(_) => Ok(WipeResult {
-            success: true,
-            message: "Path validation successful".to_string(),
-        }),
-        Err(e) => Ok(WipeResult {
-            success: false,
-            message: e.to_string(),
-        }),
+        Ok(_) => {
+            log_event("validate_drive_path", json!({"status": "success", "path": path.to_string_lossy()}));
+            Ok(WipeResult {
+                success: true,
+                message: "Path validation successful".to_string(),
+            })
+        }
+        Err(e) => {
+            log_event("validate_drive_path", json!({"status": "error", "path": path.to_string_lossy(), "message": e.to_string()}));
+            Ok(WipeResult {
+                success: false,
+                message: e.to_string(),
+            })
+        }
     }
 }
 
+/// Show a blocking warning dialog summarizing the wipe request.
 #[tauri::command]
 async fn show_confirmation_dialog<R: Runtime>(
     window: tauri::Window<R>,
@@ -475,6 +512,43 @@ async fn show_confirmation_dialog<R: Runtime>(
     Ok(confirmed)
 }
 
+/// Report platform information to the frontend for capability gating.
+#[tauri::command]
+async fn platform_info() -> Result<PlatformInfo, String> {
+    #[cfg(windows)]
+    {
+        Ok(PlatformInfo {
+            is_windows: true,
+            os: "windows".to_string(),
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Ok(PlatformInfo {
+            is_windows: false,
+            os: "macos".to_string(),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Ok(PlatformInfo {
+            is_windows: false,
+            os: "linux".to_string(),
+        })
+    }
+
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        Ok(PlatformInfo {
+            is_windows: false,
+            os: "unknown".to_string(),
+        })
+    }
+}
+
+/// Wipe free space by filling a temp file and securely deleting it.
 #[tauri::command]
 async fn execute_free_space_wipe<R: Runtime>(
     window: tauri::Window<R>,
@@ -482,7 +556,10 @@ async fn execute_free_space_wipe<R: Runtime>(
     algorithm: WipeAlgorithm,
     passes: u32
 ) -> Result<WipeResult, String> {
-    println!("Starting confirmed wipe operation for path: {}", path);
+    log_event(
+        "wipe_free_space_start",
+        json!({"path": path, "algorithm": format!("{:?}", algorithm), "passes": passes}),
+    );
     
     let path = Path::new(&path);
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -646,11 +723,13 @@ async fn execute_free_space_wipe<R: Runtime>(
     }) {
         Ok(_) => {
             if cancelled.load(Ordering::SeqCst) {
+                log_event("wipe_free_space_cancelled", json!({"path": path.to_string_lossy()}));
                 Ok(WipeResult {
                     success: false,
                     message: "Operation cancelled by user".to_string(),
                 })
             } else {
+                log_event("wipe_free_space_complete", json!({"path": path.to_string_lossy(), "status": "success"}));
                 Ok(WipeResult {
                     success: true,
                     message: format!("Successfully wiped free space"),
@@ -659,6 +738,10 @@ async fn execute_free_space_wipe<R: Runtime>(
         },
         Err(e) => {
             let _ = fs::remove_file(&temp_file_path);
+            log_event(
+                "wipe_free_space_error",
+                json!({"path": path.to_string_lossy(), "message": format!("{}", e)}),
+            );
             Ok(WipeResult {
                 success: false,
                 message: format!("Failed to wipe free space: {}", e),
@@ -667,6 +750,7 @@ async fn execute_free_space_wipe<R: Runtime>(
     }
 }
 
+/// Securely wipe files or folders using the selected algorithm.
 #[tauri::command]
 async fn wipe_files<R: Runtime>(
     window: tauri::Window<R>,
@@ -674,6 +758,10 @@ async fn wipe_files<R: Runtime>(
     passes: u32,
     algorithm: WipeAlgorithm
 ) -> Result<WipeResult, String> {
+    log_event(
+        "wipe_files_start",
+        json!({"count": paths.len(), "algorithm": format!("{:?}", algorithm), "passes": passes}),
+    );
     let mut total_files = 0;
     let mut failed_files = Vec::new();
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -754,17 +842,21 @@ async fn wipe_files<R: Runtime>(
     }
 
     if cancelled.load(Ordering::SeqCst) {
-        Ok(WipeResult {
+        let result = WipeResult {
             success: false,
             message: "Operation cancelled by user".to_string(),
-        })
+        };
+        log_event("wipe_files_end", json!({"status": "cancelled", "count": total_files, "errors": failed_files.len()}));
+        Ok(result)
     } else if failed_files.is_empty() {
-        Ok(WipeResult {
+        let result = WipeResult {
             success: true,
             message: format!("Successfully wiped {} files", total_files),
-        })
+        };
+        log_event("wipe_files_end", json!({"status": "success", "count": total_files}));
+        Ok(result)
     } else {
-        Ok(WipeResult {
+        let result = WipeResult {
             success: false,
             message: format!(
                 "Wiped {} files with {} errors:\n{}",
@@ -772,20 +864,40 @@ async fn wipe_files<R: Runtime>(
                 failed_files.len(),
                 failed_files.join("\n")
             ),
-        })
+        };
+        log_event(
+            "wipe_files_end",
+            json!({"status": "partial", "count": total_files, "errors": failed_files.len()}),
+        );
+        Ok(result)
     }
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = process_cli_side_effects(&args, log_event) {
+        std::process::exit(code);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _| {
+            handle_context_invocation(&app.app_handle(), &argv);
+        }))
         .invoke_handler(tauri::generate_handler![
             validate_drive_path,
             show_confirmation_dialog,
             execute_free_space_wipe,
-            wipe_files
+            wipe_files,
+            register_context_menu,
+            unregister_context_menu,
+            get_context_menu_status,
+            platform_info
         ])
         .setup(|app| {
+            let initial_args: Vec<String> = std::env::args().collect();
+            handle_context_invocation(&app.app_handle(), &initial_args);
+
             // Set up window close handler
             if let Some(window) = app.get_webview_window("main") {
                 let window_clone = window.clone();
@@ -831,7 +943,7 @@ fn main() {
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                .menu_on_left_click(false)
+                .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => {
                         app.exit(0);
@@ -872,6 +984,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::thread;
     use std::time::Duration;
+    use crate::platform::context_menu::{
+        collect_context_paths,
+        sanitize_context_paths,
+        enable_context_menu,
+        disable_context_menu,
+        is_context_menu_enabled,
+    };
 
     fn get_unique_id() -> u128 {
         thread::sleep(Duration::from_millis(10)); // Ensure unique timestamps
@@ -929,6 +1048,78 @@ mod tests {
         
         println!("Successfully created test file: {:?}", file_path);
         Ok(file_path)
+    }
+
+    #[test]
+    fn collect_context_paths_parses_cli_arguments() {
+        let args = vec![
+            "BitBurn.exe".to_string(),
+            "--context-wipe".to_string(),
+            "C:/example/file1.txt".to_string(),
+            "--other".to_string(),
+            "D:/second.bin".to_string(),
+        ];
+
+        let collected = collect_context_paths(&args);
+        assert_eq!(collected, vec![
+            "C:/example/file1.txt".to_string(),
+            "D:/second.bin".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn collect_context_paths_splits_multi_value_argument() {
+        let args = vec![
+            "BitBurn.exe".to_string(),
+            "--context-wipe".to_string(),
+            "C:/one.txt|D:/two.txt;E:/three.txt\nF:/four.txt".to_string(),
+        ];
+
+        let collected = collect_context_paths(&args);
+        assert_eq!(collected, vec![
+            "C:/one.txt".to_string(),
+            "D:/two.txt".to_string(),
+            "E:/three.txt".to_string(),
+            "F:/four.txt".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn sanitize_context_paths_filters_invalid_entries() {
+        let dir = create_test_dir().expect("should create temp dir");
+        let valid_file = create_test_file(&dir, b"test").expect("should create file");
+        let missing = dir.join("missing.bin");
+
+        let payload = sanitize_context_paths(vec![
+            valid_file.to_string_lossy().to_string(),
+            "\\\\server\\share\\file.txt".to_string(),
+            missing.to_string_lossy().to_string(),
+        ]);
+
+        assert_eq!(payload.paths.len(), 1);
+        assert_eq!(payload.invalid.len(), 2);
+        assert!(payload.paths[0].contains("test_file_"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn enable_disable_context_menu_respects_override_root() {
+        let temp_root = format!(
+            "Software\\Classes\\BitBurnTest_{}",
+            get_unique_id()
+        );
+        std::env::set_var("BITBURN_CONTEXT_ROOT", &temp_root);
+
+        let dummy_exe = PathBuf::from("C:/BitBurn/BitBurn.exe");
+
+        enable_context_menu(&dummy_exe).expect("should write context menu keys");
+        assert!(is_context_menu_enabled().unwrap());
+
+        disable_context_menu().expect("should remove context menu keys");
+        assert!(!is_context_menu_enabled().unwrap());
+
+        // Cleanup env override
+        std::env::remove_var("BITBURN_CONTEXT_ROOT");
     }
 
     fn cleanup_test_dir(dir: &Path) {
