@@ -25,6 +25,7 @@ use platform::context_menu::{
     unregister_context_menu,
 };
 
+/// Errors that can occur while securely wiping files.
 #[derive(Debug)]
 pub enum WipeError {
     PathNotFound,
@@ -61,6 +62,7 @@ pub enum WipeAlgorithm {
     Random,         // N passes of random data (replaces DOD_E and custom needs)
 }
 
+/// Progress payload emitted to the UI during wipe operations.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WipeProgress {
     current_pass: u32,
@@ -443,6 +445,7 @@ where
     Ok(())
 }
 
+/// Validation errors for drive-root selection when wiping free space.
 #[derive(Debug)]
 pub enum DriveValidationError {
     PathNotFound,
@@ -1289,5 +1292,21 @@ mod tests {
         
         cleanup_test_dir(&test_dir);
         Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn platform_info_reports_non_windows() {
+        let info = tauri::async_runtime::block_on(platform_info()).expect("platform_info should succeed");
+        assert!(!info.is_windows);
+        assert_ne!(info.os, "windows");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn platform_info_reports_windows() {
+        let info = tauri::async_runtime::block_on(platform_info()).expect("platform_info should succeed");
+        assert!(info.is_windows);
+        assert_eq!(info.os, "windows");
     }
 }

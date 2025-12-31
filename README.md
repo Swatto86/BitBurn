@@ -37,6 +37,17 @@ BitBurn is a modern, secure file and drive wiping utility built with Rust and Ta
   - System tray integration
   - Cancellable operations
 
+  ## Quick Start
+
+  - Install dependencies: `npm install`
+  - Dev (frontend + Tauri): `npm run tauri dev`
+  - Build production bundle: `npm run tauri build`
+  - Backend/frontend tests: `npm test` (runs vitest and cargo tests)
+
+  ## Platform Notes
+
+  - System tray requires bundled icons; missing icons cause tray init to fail fast. Ensure `icons/` is present when packaging.
+
 ## Wiping Algorithms
 
 ### NIST 800-88 Clear
