@@ -6,18 +6,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
-use std::path::Path;
-use tauri::{
-    menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Listener, Manager, Runtime, WindowEvent,
-};
+use std::path::{Path, PathBuf};
+use tauri::{Emitter, Listener, Manager, Runtime};
+use tauri::async_runtime::spawn_blocking;
 use walkdir::WalkDir;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use sysinfo::{DiskExt, System, SystemExt};
 mod platform;
+mod ui;
 
 use platform::context_menu::{
     get_context_menu_status,
@@ -53,7 +51,9 @@ impl std::error::Error for WipeError {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Supported wipe algorithms exposed to the frontend.
+/// Each variant maps to a specific pass count and pattern strategy enforced in the backend.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum WipeAlgorithm {
     NistClear,      // NIST 800-88 Clear: 1 pass zeros (replaces Basic)
     NistPurge,      // NIST 800-88 Purge: 3 pass overwrite (replaces DOD)
@@ -98,12 +98,30 @@ impl WipeProgress {
     }
 }
 
+/// User-facing result payload returned by wipe commands.
+/// Carries a success flag and human-readable status message for UI display.
 #[derive(Serialize)]
 pub struct WipeResult {
     success: bool,
     message: String,
 }
 
+fn cancelled_wipe_result() -> WipeResult {
+    WipeResult {
+        success: false,
+        message: "Operation cancelled by user".to_string(),
+    }
+}
+
+fn free_space_error_result(message: impl Into<String>) -> WipeResult {
+    WipeResult {
+        success: false,
+        message: message.into(),
+    }
+}
+
+/// Context menu registration status returned to the frontend.
+/// Reports whether shell integration is enabled and any explanatory message.
 #[derive(Serialize)]
 pub struct ContextMenuStatus {
     enabled: bool,
@@ -454,6 +472,7 @@ fn validate_drive_path_internal(path: &Path) -> Result<(), DriveValidationError>
 }
 
 /// Validate that the provided path is an existing drive root (e.g., "C:\").
+/// Returns a user-friendly `WipeResult` describing success or the validation failure.
 #[tauri::command]
 async fn validate_drive_path(path: String) -> Result<WipeResult, String> {
     let path = Path::new(&path);
@@ -477,6 +496,7 @@ async fn validate_drive_path(path: String) -> Result<WipeResult, String> {
 }
 
 /// Show a blocking warning dialog summarizing the wipe request.
+/// The dialog warns the user about the impending wipe and returns their confirmation choice.
 #[tauri::command]
 async fn show_confirmation_dialog<R: Runtime>(
     window: tauri::Window<R>,
@@ -513,6 +533,7 @@ async fn show_confirmation_dialog<R: Runtime>(
 }
 
 /// Report platform information to the frontend for capability gating.
+/// Used by the UI to toggle platform-specific controls without leaking OS concerns into core logic.
 #[tauri::command]
 async fn platform_info() -> Result<PlatformInfo, String> {
     #[cfg(windows)]
@@ -549,6 +570,7 @@ async fn platform_info() -> Result<PlatformInfo, String> {
 }
 
 /// Wipe free space by filling a temp file and securely deleting it.
+/// Blocks heavy I/O on a worker thread while emitting progress events to the main window.
 #[tauri::command]
 async fn execute_free_space_wipe<R: Runtime>(
     window: tauri::Window<R>,
@@ -556,201 +578,185 @@ async fn execute_free_space_wipe<R: Runtime>(
     algorithm: WipeAlgorithm,
     passes: u32
 ) -> Result<WipeResult, String> {
-    log_event(
-        "wipe_free_space_start",
-        json!({"path": path, "algorithm": format!("{:?}", algorithm), "passes": passes}),
-    );
-    
-    let path = Path::new(&path);
+    let window_label = window.label().to_string();
+    let app_handle = window.app_handle().clone();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let cancelled_clone = cancelled.clone();
-    
-    // Set up cancellation handler
-    let _unregister = window.once("cancel_operation", move |_| {
-        cancelled_clone.store(true, Ordering::SeqCst);
+    let cancel_for_listener = cancelled.clone();
+
+    let _cancel_listener = app_handle.listen("cancel_operation", move |_| {
+        cancel_for_listener.store(true, Ordering::SeqCst);
     });
-    
-    // Validate again just to be safe
-    if let Err(e) = validate_drive_path_internal(path) {
-        return Ok(WipeResult {
-            success: false,
-            message: e.to_string(),
-        });
-    }
 
-    // Initialize system info
-    let mut sys = System::new_all();
-    sys.refresh_disks_list();
-    
-    // Find the disk that contains our path
-    let disk_info = sys.disks().iter()
-        .find(|disk| path.starts_with(disk.mount_point()))
-        .ok_or_else(|| "Could not find disk information".to_string())?;
-    
-    let available_space = disk_info.available_space();
-    println!("Available space on drive: {} bytes", available_space);
+    let path_buf = PathBuf::from(path);
+    let algo_for_task = algorithm.clone();
 
-    let window_clone = window.clone();
-    let cancelled_clone = cancelled.clone();
-    let progress_callback = move |progress| {
-        if !cancelled_clone.load(Ordering::SeqCst) {
-            let _ = window_clone.emit_to("main", "wipe_progress", progress);
+    let join_result = spawn_blocking(move || {
+        let path = path_buf;
+
+        log_event(
+            "wipe_free_space_start",
+            json!({"path": path.to_string_lossy(), "algorithm": format!("{:?}", algo_for_task), "passes": passes}),
+        );
+
+        // Validate again just to be safe
+        if let Err(e) = validate_drive_path_internal(&path) {
+            return Ok(free_space_error_result(e.to_string()));
         }
-    };
 
-    let mut progress = WipeProgress::new(
-        passes,
-        0,
-        match algorithm {
-            WipeAlgorithm::NistClear => "NIST 800-88 Clear",
-            WipeAlgorithm::NistPurge => "NIST 800-88 Purge",
-            WipeAlgorithm::Gutmann => "Gutmann",
-            WipeAlgorithm::Random => "Random",
-        }
-    );
-    
-    // Set the estimated total bytes to the available space
-    progress.estimated_total_bytes = Some(available_space);
+        let mut sys = System::new_all();
+        sys.refresh_disks_list();
 
-    // Create and fill temporary file
-    println!("Creating temporary file");
-    progress.update(0, "Filling drive space");
-    progress_callback(progress.clone());
+        let disk_info = sys
+            .disks()
+            .iter()
+            .find(|disk| path.starts_with(disk.mount_point()))
+            .ok_or_else(|| "Could not find disk information".to_string())?;
 
-    let temp_file_path = path.join(".temp_wipe_file");
-    
-    // Check for existing temp file
-    if temp_file_path.exists() {
-        println!("Existing temporary file found, attempting to remove");
-        progress.update(0, "Cleaning up previous temporary file");
+        let available_space = disk_info.available_space();
+        let cancelled_clone = cancelled.clone();
+        let app_handle = app_handle.clone();
+        let window_label = window_label.clone();
+        let progress_callback = move |progress: WipeProgress| {
+            if !cancelled_clone.load(Ordering::SeqCst) {
+                let _ = app_handle.emit_to(&window_label, "wipe_progress", progress);
+            }
+        };
+
+        let mut progress = WipeProgress::new(
+            passes,
+            0,
+            match algo_for_task {
+                WipeAlgorithm::NistClear => "NIST 800-88 Clear",
+                WipeAlgorithm::NistPurge => "NIST 800-88 Purge",
+                WipeAlgorithm::Gutmann => "Gutmann",
+                WipeAlgorithm::Random => "Random",
+            },
+        );
+
+        progress.estimated_total_bytes = Some(available_space);
+
+        progress.update(0, "Filling drive space");
         progress_callback(progress.clone());
-        if let Err(e) = fs::remove_file(&temp_file_path) {
-            return Ok(WipeResult {
-                success: false,
-                message: format!("Failed to remove existing temporary file: {}", e),
-            });
-        }
-    }
 
-    let mut file = match OpenOptions::new()
-        .write(true)
-        .create(true)
-        .open(&temp_file_path) {
+        let temp_file_path = path.join(".temp_wipe_file");
+
+        if temp_file_path.exists() {
+            progress.update(0, "Cleaning up previous temporary file");
+            progress_callback(progress.clone());
+            if let Err(e) = fs::remove_file(&temp_file_path) {
+                return Ok(free_space_error_result(format!(
+                    "Failed to remove existing temporary file: {}",
+                    e
+                )));
+            }
+        }
+
+        let mut file = match OpenOptions::new().write(true).create(true).open(&temp_file_path) {
             Ok(f) => f,
             Err(e) => {
-                return Ok(WipeResult {
-                    success: false,
-                    message: format!("Failed to create temporary file: {}", e),
-                });
+                return Ok(free_space_error_result(format!(
+                    "Failed to create temporary file: {}",
+                    e
+                )));
             }
-    };
+        };
 
-    // Write data in chunks until disk is full
-    let chunk_size = 1024 * 1024; // 1MB chunks
-    let mut buffer = vec![0u8; chunk_size];
-    let mut rng = rand::thread_rng();
-    let mut total_written = 0u64;
-    let mut last_refresh = std::time::Instant::now();
-    let mut last_space_used = 0u64;
+        let chunk_size = 1024 * 1024; // 1MB chunks
+        let mut buffer = vec![0u8; chunk_size];
+        let mut rng = rand::thread_rng();
+        let mut total_written = 0u64;
+        let mut last_refresh = std::time::Instant::now();
+        let mut last_space_used = 0u64;
 
-    loop {
-        // Check for cancellation
-        if cancelled.load(Ordering::SeqCst) {
-            let _ = file.sync_all();
-            let _ = fs::remove_file(&temp_file_path);
-            return Ok(WipeResult {
-                success: false,
-                message: "Operation cancelled by user".to_string(),
-            });
-        }
-
-        // Refresh disk info every 100ms to avoid excessive system calls
-        if last_refresh.elapsed() >= std::time::Duration::from_millis(100) {
-            sys.refresh_disks_list();
-            if let Some(disk) = sys.disks().iter().find(|disk| path.starts_with(disk.mount_point())) {
-                let current_available = disk.available_space();
-                last_space_used = available_space - current_available;
+        loop {
+            if cancelled.load(Ordering::SeqCst) {
+                let _ = file.sync_all();
+                let _ = fs::remove_file(&temp_file_path);
+                return Ok(cancelled_wipe_result());
             }
-            last_refresh = std::time::Instant::now();
-        }
 
-        rng.fill_bytes(&mut buffer);
-        match file.write_all(&buffer) {
-            Ok(_) => {
-                total_written += chunk_size as u64;
-                
-                // Update progress after every chunk write
-                progress.update(last_space_used, &format!("Filling drive space ({} MB written)", total_written / 1024 / 1024));
-                progress_callback(progress.clone());
-                
-                if total_written % (10 * chunk_size as u64) == 0 {
-                    if let Err(_) = file.sync_all() {
+            if last_refresh.elapsed() >= std::time::Duration::from_millis(100) {
+                sys.refresh_disks_list();
+                if let Some(disk) = sys.disks().iter().find(|disk| path.starts_with(disk.mount_point())) {
+                    let current_available = disk.available_space();
+                    last_space_used = available_space - current_available;
+                }
+                last_refresh = std::time::Instant::now();
+            }
+
+            rng.fill_bytes(&mut buffer);
+            match file.write_all(&buffer) {
+                Ok(_) => {
+                    total_written += chunk_size as u64;
+                    progress.update(last_space_used, &format!("Filling drive space ({} MB written)", total_written / 1024 / 1024));
+                    progress_callback(progress.clone());
+
+                    if total_written % (10 * chunk_size as u64) == 0 {
+                        if let Err(_) = file.sync_all() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::StorageFull
+                        || e.kind() == io::ErrorKind::OutOfMemory
+                        || e.kind() == io::ErrorKind::WriteZero
+                    {
+                        sys.refresh_disks_list();
+                        if let Some(disk) = sys.disks().iter().find(|disk| path.starts_with(disk.mount_point())) {
+                            let current_available = disk.available_space();
+                            let space_used = available_space - current_available;
+                            progress.update(space_used, "Drive space filled");
+                            progress_callback(progress.clone());
+                        }
                         break;
                     }
+                    let _ = fs::remove_file(&temp_file_path);
+                    return Ok(free_space_error_result(format!(
+                        "Failed to write to temporary file: {}",
+                        e
+                    )));
                 }
-            },
-            Err(e) => {
-                if e.kind() == io::ErrorKind::StorageFull || 
-                   e.kind() == io::ErrorKind::OutOfMemory ||
-                   e.kind() == io::ErrorKind::WriteZero {
-                    // One final refresh of disk info
-                    sys.refresh_disks_list();
-                    if let Some(disk) = sys.disks().iter().find(|disk| path.starts_with(disk.mount_point())) {
-                        let current_available = disk.available_space();
-                        let space_used = available_space - current_available;
-                        progress.update(space_used, "Drive space filled");
-                        progress_callback(progress.clone());
-                    }
-                    break;
-                }
-                let _ = fs::remove_file(&temp_file_path);
-                return Ok(WipeResult {
-                    success: false,
-                    message: format!("Failed to write to temporary file: {}", e),
-                });
             }
         }
-    }
 
-    // Now wipe the temporary file
-    progress.total_bytes = total_written;
-    let cancelled_clone = cancelled.clone();
-    match secure_wipe_file(&temp_file_path, passes, &algorithm, move |p| {
-        // Check for cancellation during wiping
-        if !cancelled_clone.load(Ordering::SeqCst) {
-            progress_callback(p);
-        }
-    }) {
-        Ok(_) => {
-            if cancelled.load(Ordering::SeqCst) {
-                log_event("wipe_free_space_cancelled", json!({"path": path.to_string_lossy()}));
-                Ok(WipeResult {
-                    success: false,
-                    message: "Operation cancelled by user".to_string(),
-                })
-            } else {
-                log_event("wipe_free_space_complete", json!({"path": path.to_string_lossy(), "status": "success"}));
-                Ok(WipeResult {
-                    success: true,
-                    message: format!("Successfully wiped free space"),
-                })
+        progress.total_bytes = total_written;
+        let cancelled_clone = cancelled.clone();
+        match secure_wipe_file(&temp_file_path, passes, &algo_for_task, move |p| {
+            if !cancelled_clone.load(Ordering::SeqCst) {
+                progress_callback(p);
             }
-        },
-        Err(e) => {
-            let _ = fs::remove_file(&temp_file_path);
-            log_event(
-                "wipe_free_space_error",
-                json!({"path": path.to_string_lossy(), "message": format!("{}", e)}),
-            );
-            Ok(WipeResult {
-                success: false,
-                message: format!("Failed to wipe free space: {}", e),
-            })
-        },
-    }
+        }) {
+            Ok(_) => {
+                if cancelled.load(Ordering::SeqCst) {
+                    log_event("wipe_free_space_cancelled", json!({"path": path.to_string_lossy()}));
+                    Ok(cancelled_wipe_result())
+                } else {
+                    log_event("wipe_free_space_complete", json!({"path": path.to_string_lossy(), "status": "success"}));
+                    Ok(WipeResult {
+                        success: true,
+                        message: "Successfully wiped free space".to_string(),
+                    })
+                }
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&temp_file_path);
+                log_event(
+                    "wipe_free_space_error",
+                    json!({"path": path.to_string_lossy(), "message": format!("{}", e)}),
+                );
+                Ok(free_space_error_result(format!("Failed to wipe free space: {}", e)))
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("wipe_free_space task join error: {}", e))?;
+
+    join_result
 }
 
 /// Securely wipe files or folders using the selected algorithm.
+/// Runs in a blocking task to avoid UI stalls and streams progress to the main window.
 #[tauri::command]
 async fn wipe_files<R: Runtime>(
     window: tauri::Window<R>,
@@ -758,119 +764,125 @@ async fn wipe_files<R: Runtime>(
     passes: u32,
     algorithm: WipeAlgorithm
 ) -> Result<WipeResult, String> {
-    log_event(
-        "wipe_files_start",
-        json!({"count": paths.len(), "algorithm": format!("{:?}", algorithm), "passes": passes}),
-    );
-    let mut total_files = 0;
-    let mut failed_files = Vec::new();
+    let window_label = window.label().to_string();
+    let app_handle = window.app_handle().clone();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let cancelled_clone = cancelled.clone();
+    let cancel_for_listener = cancelled.clone();
 
-    // Set up cancellation handler
-    let _unregister = window.once("cancel_operation", move |_| {
-        cancelled_clone.store(true, Ordering::SeqCst);
+    let _cancel_listener = app_handle.listen("cancel_operation", move |_| {
+        cancel_for_listener.store(true, Ordering::SeqCst);
     });
 
-    for path_str in paths {
-        if cancelled.load(Ordering::SeqCst) {
-            return Ok(WipeResult {
-                success: false,
-                message: "Operation cancelled by user".to_string(),
-            });
-        }
+    let paths_for_task = paths.clone();
+    let algo_for_task = algorithm.clone();
 
-        let path = Path::new(&path_str);
-        
-        if !path.exists() {
-            failed_files.push(format!("Path not found: {}", path_str));
-            continue;
-        }
+    let join_result = spawn_blocking(move || {
+        log_event(
+            "wipe_files_start",
+            json!({"count": paths_for_task.len(), "algorithm": format!("{:?}", algo_for_task), "passes": passes}),
+        );
 
-        if path.is_file() {
-            let window_clone = window.clone();
-            let cancelled_clone = cancelled.clone();
-            match secure_wipe_file(
-                path,
-                passes,
-                &algorithm,
+        let mut total_files = 0;
+        let mut failed_files = Vec::new();
+
+        for path_str in paths_for_task {
+            if cancelled.load(Ordering::SeqCst) {
+                return Ok(cancelled_wipe_result());
+            }
+
+            let path = Path::new(&path_str);
+
+            if !path.exists() {
+                failed_files.push(format!("Path not found: {}", path_str));
+                continue;
+            }
+
+            let emit_progress = {
+                let app_handle = app_handle.clone();
+                let window_label = window_label.clone();
+                let cancelled_clone = cancelled.clone();
                 move |progress| {
                     if !cancelled_clone.load(Ordering::SeqCst) {
-                        let _ = window_clone.emit_to("main", "wipe_progress", progress);
+                        let _ = app_handle.emit_to(&window_label, "wipe_progress", progress);
                     }
                 }
-            ) {
-                Ok(_) => total_files += 1,
-                Err(e) => failed_files.push(format!("Failed to wipe {}: {}", path_str, e)),
-            }
-        } else if path.is_dir() {
-            let files: Vec<_> = WalkDir::new(path)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
-                .collect();
+            };
 
-            for entry in files {
-                if cancelled.load(Ordering::SeqCst) {
-                    return Ok(WipeResult {
-                        success: false,
-                        message: "Operation cancelled by user".to_string(),
-                    });
-                }
-
-                let window_clone = window.clone();
-                let cancelled_clone = cancelled.clone();
-                match secure_wipe_file(
-                    entry.path(),
-                    passes,
-                    &algorithm,
-                    move |progress| {
-                        if !cancelled_clone.load(Ordering::SeqCst) {
-                            let _ = window_clone.emit_to("main", "wipe_progress", progress);
-                        }
-                    }
-                ) {
+            if path.is_file() {
+                match secure_wipe_file(path, passes, &algo_for_task, emit_progress) {
                     Ok(_) => total_files += 1,
-                    Err(e) => failed_files.push(format!("Failed to wipe {}: {}", entry.path().display(), e)),
+                    Err(e) => failed_files.push(format!("Failed to wipe {}: {}", path_str, e)),
                 }
-            }
+            } else if path.is_dir() {
+                let files: Vec<_> = WalkDir::new(path)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_file())
+                    .collect();
 
-            if let Err(e) = fs::remove_dir_all(path) {
-                failed_files.push(format!("Failed to remove directory {}: {}", path_str, e));
+                for entry in files {
+                    if cancelled.load(Ordering::SeqCst) {
+                        return Ok(WipeResult {
+                            success: false,
+                            message: "Operation cancelled by user".to_string(),
+                        });
+                    }
+
+                    let emit_progress = {
+                        let app_handle = app_handle.clone();
+                        let window_label = window_label.clone();
+                        let cancelled_clone = cancelled.clone();
+                        move |progress| {
+                            if !cancelled_clone.load(Ordering::SeqCst) {
+                                let _ = app_handle.emit_to(&window_label, "wipe_progress", progress);
+                            }
+                        }
+                    };
+
+                    match secure_wipe_file(entry.path(), passes, &algo_for_task, emit_progress) {
+                        Ok(_) => total_files += 1,
+                        Err(e) => failed_files.push(format!("Failed to wipe {}: {}", entry.path().display(), e)),
+                    }
+                }
+
+                if let Err(e) = fs::remove_dir_all(path) {
+                    failed_files.push(format!("Failed to remove directory {}: {}", path_str, e));
+                }
             }
         }
-    }
 
-    if cancelled.load(Ordering::SeqCst) {
-        let result = WipeResult {
-            success: false,
-            message: "Operation cancelled by user".to_string(),
-        };
-        log_event("wipe_files_end", json!({"status": "cancelled", "count": total_files, "errors": failed_files.len()}));
-        Ok(result)
-    } else if failed_files.is_empty() {
-        let result = WipeResult {
-            success: true,
-            message: format!("Successfully wiped {} files", total_files),
-        };
-        log_event("wipe_files_end", json!({"status": "success", "count": total_files}));
-        Ok(result)
-    } else {
-        let result = WipeResult {
-            success: false,
-            message: format!(
-                "Wiped {} files with {} errors:\n{}",
-                total_files,
-                failed_files.len(),
-                failed_files.join("\n")
-            ),
-        };
-        log_event(
-            "wipe_files_end",
-            json!({"status": "partial", "count": total_files, "errors": failed_files.len()}),
-        );
-        Ok(result)
-    }
+            if cancelled.load(Ordering::SeqCst) {
+                let result = cancelled_wipe_result();
+                log_event("wipe_files_end", json!({"status": "cancelled", "count": total_files, "errors": failed_files.len()}));
+                Ok(result)
+            } else if failed_files.is_empty() {
+            let result = WipeResult {
+                success: true,
+                message: format!("Successfully wiped {} files", total_files),
+            };
+            log_event("wipe_files_end", json!({"status": "success", "count": total_files}));
+            Ok(result)
+        } else {
+            let result = WipeResult {
+                success: false,
+                message: format!(
+                    "Wiped {} files with {} errors:\n{}",
+                    total_files,
+                    failed_files.len(),
+                    failed_files.join("\n")
+                ),
+            };
+            log_event(
+                "wipe_files_end",
+                json!({"status": "partial", "count": total_files, "errors": failed_files.len()}),
+            );
+            Ok(result)
+        }
+    })
+    .await
+    .map_err(|e| format!("wipe_files task join error: {}", e))?;
+
+    join_result
 }
 
 fn main() {
@@ -897,78 +909,7 @@ fn main() {
         .setup(|app| {
             let initial_args: Vec<String> = std::env::args().collect();
             handle_context_invocation(&app.app_handle(), &initial_args);
-
-            // Set up window close handler
-            if let Some(window) = app.get_webview_window("main") {
-                let window_clone = window.clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        window_clone.hide().unwrap();
-                        api.prevent_close();
-                    }
-                });
-            }
-
-            // Position and show the main window on launch
-            if let Some(window) = app.get_webview_window("main") {
-                let window_clone = window.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = window_clone.center();
-                    if let Some(monitor) = window_clone.current_monitor().ok().flatten() {
-                        let monitor_size = monitor.size();
-                        let height_percentage = 0.80;
-                        let window_height = (monitor_size.height as f64 * height_percentage) as u32;
-                        
-                        // Set the window size to use the percentage of screen height
-                        let _ = window_clone.set_size(tauri::Size::Physical(tauri::PhysicalSize {
-                            width: window_clone.outer_size().unwrap().width,
-                            height: window_height,
-                        }));
-                        
-                        // Center the window after resizing
-                        let _ = window_clone.center();
-                    }
-                    let _ = window_clone.show();
-                    let _ = window_clone.set_focus();
-                });
-            }
-
-            // Create menu items
-            let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-
-            // Create the menu
-            let menu = Menu::with_items(app, &[&quit_i])?;
-
-            // Build the tray
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| match event {
-                    TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } => {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            if window.is_visible().unwrap_or(false) {
-                                let _ = window.hide();
-                            } else {
-                                let _ = window.show();
-                            }
-                        }
-                    }
-                    _ => {}
-                })
-                .build(app)?;
-
+            ui::init_ui(&app.app_handle())?;
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -1120,6 +1061,27 @@ mod tests {
 
         // Cleanup env override
         std::env::remove_var("BITBURN_CONTEXT_ROOT");
+    }
+
+    #[test]
+    fn validate_drive_path_rejects_non_root() {
+        let temp_dir = std::env::temp_dir();
+        let result = validate_drive_path_internal(temp_dir.as_path());
+        assert!(matches!(result, Err(DriveValidationError::NotDriveRoot)));
+    }
+
+    #[test]
+    fn cancelled_wipe_result_has_expected_message() {
+        let result = cancelled_wipe_result();
+        assert!(!result.success);
+        assert_eq!(result.message, "Operation cancelled by user");
+    }
+
+    #[test]
+    fn free_space_error_result_formats_message() {
+        let result = free_space_error_result("sample error".to_string());
+        assert!(!result.success);
+        assert_eq!(result.message, "sample error");
     }
 
     fn cleanup_test_dir(dir: &Path) {
