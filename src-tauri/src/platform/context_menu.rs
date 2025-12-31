@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 use thiserror::Error;
 
+/// Payload delivered to the frontend when a context-menu wipe is invoked.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ContextWipePayload {
     pub paths: Vec<String>,
@@ -287,6 +288,35 @@ where
     None
 }
 
+#[cfg(test)]
+mod tests {
+
+    #[cfg(not(windows))]
+    #[test]
+    fn register_context_menu_is_unavailable_on_non_windows() {
+        let result = tauri::async_runtime::block_on(super::register_context_menu()).expect("command should return result");
+        assert!(!result.success);
+        assert!(result.message.contains("not available"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unregister_context_menu_is_unavailable_on_non_windows() {
+        let result = tauri::async_runtime::block_on(super::unregister_context_menu()).expect("command should return result");
+        assert!(!result.success);
+        assert!(result.message.contains("not available"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn get_context_menu_status_is_unavailable_on_non_windows() {
+        let status = tauri::async_runtime::block_on(super::get_context_menu_status()).expect("command should return result");
+        assert!(!status.enabled);
+        assert!(status.message.contains("not available"));
+    }
+}
+
+/// Register the Explorer context menu entries (Windows only).
 #[tauri::command]
 pub async fn register_context_menu() -> Result<crate::WipeResult, String> {
     #[cfg(windows)]
@@ -310,6 +340,7 @@ pub async fn register_context_menu() -> Result<crate::WipeResult, String> {
     }
 }
 
+/// Unregister the Explorer context menu entries (Windows only).
 #[tauri::command]
 pub async fn unregister_context_menu() -> Result<crate::WipeResult, String> {
     #[cfg(windows)]
@@ -332,6 +363,7 @@ pub async fn unregister_context_menu() -> Result<crate::WipeResult, String> {
     }
 }
 
+/// Report whether the Explorer context menu entries are currently installed.
 #[tauri::command]
 pub async fn get_context_menu_status() -> Result<crate::ContextMenuStatus, String> {
     #[cfg(windows)]
