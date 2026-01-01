@@ -24,6 +24,7 @@ use platform::context_menu::{
     register_context_menu,
     unregister_context_menu,
 };
+use platform::autostart::{get_autostart_status, register_autostart, unregister_autostart};
 
 /// Errors that can occur while securely wiping files.
 #[derive(Debug)]
@@ -126,6 +127,13 @@ fn free_space_error_result(message: impl Into<String>) -> WipeResult {
 /// Reports whether shell integration is enabled and any explanatory message.
 #[derive(Serialize)]
 pub struct ContextMenuStatus {
+    enabled: bool,
+    message: String,
+}
+
+/// Autostart registration status returned to the frontend.
+#[derive(Serialize)]
+pub struct AutostartStatus {
     enabled: bool,
     message: String,
 }
@@ -907,6 +915,9 @@ fn main() {
             register_context_menu,
             unregister_context_menu,
             get_context_menu_status,
+            register_autostart,
+            unregister_autostart,
+            get_autostart_status,
             platform_info
         ])
         .setup(|app| {

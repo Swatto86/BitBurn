@@ -28,11 +28,6 @@ interface ContextWipePayload {
   source: string;
 }
 
-interface ContextMenuStatus {
-  enabled: boolean;
-  message: string;
-}
-
 const MAX_FILE_SIZE = 1024 * 1024 * 1024 * 10; // 10GB warning threshold
 
 function App() {
@@ -58,47 +53,10 @@ function App() {
     useState<AbortController | null>(null);
   const [isContextMode, setIsContextMode] = useState(false);
   const [contextInvalidPaths, setContextInvalidPaths] = useState<string[]>([]);
-  const [isWindows, setIsWindows] = useState(false);
-  const [contextMenuEnabled, setContextMenuEnabled] =
-    useState<boolean | null>(null);
-  const [contextMenuMessage, setContextMenuMessage] =
-    useState<string | null>(null);
-  const [contextMenuBusy, setContextMenuBusy] = useState(false);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
   }, []);
-
-  useEffect(() => {
-    const detectPlatform = async () => {
-      const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
-      const hasTauriIpc =
-        typeof window !== "undefined" && "__TAURI_IPC__" in window;
-
-      if (hasTauriIpc) {
-        try {
-          const info = (await invoke("platform_info")) as {
-            is_windows?: boolean;
-          };
-          if (typeof info?.is_windows === "boolean") {
-            setIsWindows(info.is_windows);
-            return;
-          }
-        } catch (error) {
-          console.error("Unable to detect platform:", error);
-        }
-      }
-
-      setIsWindows(ua.toLowerCase().includes("windows"));
-    };
-
-    detectPlatform();
-  }, []);
-
-  useEffect(() => {
-    if (!isWindows) return;
-    refreshContextMenuStatus();
-  }, [isWindows]);
 
   const toggleTheme = () => {
     const newTheme = theme === "dark" ? "light" : "dark";
@@ -354,23 +312,6 @@ function App() {
     }, 3000);
   };
 
-  const flashMessage = (success: boolean, message: string) => {
-    setResult({ success, message });
-    setTimeout(() => setResult(null), 2500);
-  };
-
-  const refreshContextMenuStatus = async () => {
-    if (!isWindows) return;
-    try {
-      const status = (await invoke("get_context_menu_status")) as ContextMenuStatus;
-      setContextMenuEnabled(status.enabled);
-      setContextMenuMessage(status.message);
-    } catch (error) {
-      console.error("Unable to fetch context menu status:", error);
-      setContextMenuMessage("Unable to query context menu status");
-    }
-  };
-
   const handleWipe = async () => {
     if (selectedPaths.length === 0) return;
 
@@ -524,26 +465,6 @@ function App() {
     }
   };
 
-  const toggleContextMenu = async (enable: boolean) => {
-    if (!isWindows) return;
-    setContextMenuBusy(true);
-    try {
-      const result = (await invoke(
-        enable ? "register_context_menu" : "unregister_context_menu",
-      )) as { success?: boolean; message?: string };
-      await refreshContextMenuStatus();
-      flashMessage(
-        Boolean(result?.success),
-        result?.message || "Context menu updated",
-      );
-    } catch (error) {
-      console.error("Context menu update failed:", error);
-      flashMessage(false, `Context menu update failed: ${error}`);
-    } finally {
-      setContextMenuBusy(false);
-    }
-  };
-
   return (
     <div className="min-h-screen bg-base-100 text-base-content">
       <div className="container mx-auto px-4 py-8 flex flex-col items-center max-h-screen overflow-hidden">
@@ -659,34 +580,6 @@ function App() {
               </div>
             </div>
           </div>
-
-          {isWindows && (
-            <div className="card bg-base-200 p-4 w-full">
-              <div className="flex flex-col gap-2">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h3 className="font-semibold text-lg">
-                      Windows Explorer Context Menu
-                    </h3>
-                    <p className="text-sm text-gray-400">
-                      Adds BitBurn -&gt; Shred -&gt; Choose Shred Algorithm to the
-                      file/folder right-click menu.
-                    </p>
-                  </div>
-                  <button
-                    className="btn btn-outline btn-sm"
-                    disabled={contextMenuBusy || contextMenuEnabled === null}
-                    onClick={() => toggleContextMenu(!contextMenuEnabled)}
-                  >
-                    {contextMenuEnabled ? "Remove" : "Add"} Context Menu
-                  </button>
-                </div>
-                {contextMenuMessage && (
-                  <p className="text-sm text-gray-400">{contextMenuMessage}</p>
-                )}
-              </div>
-            </div>
-          )}
 
           {/* Operation Selection - Only visible in initial mode */}
           {operationMode === "initial" && !isWiping && (
@@ -848,6 +741,56 @@ function App() {
                   </div>
 
                   <div className="flex justify-end gap-3 pt-2">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 mr-4">
+                      <div className="form-control">
+                        <label className="label">
+                          <span className="label-text">Wipe Algorithm</span>
+                        </label>
+                        <select
+                          value={algorithm}
+                          onChange={(e) =>
+                            setAlgorithm(e.target.value as typeof algorithm)
+                          }
+                          className="select select-bordered w-full"
+                          disabled={isWiping}
+                        >
+                          <option value="NistClear">NIST 800-88 Clear (Quick)</option>
+                          <option value="NistPurge">NIST 800-88 Purge (Recommended)</option>
+                          <option value="Gutmann">Gutmann (Very Slow)</option>
+                          <option value="Random">Random Passes (Custom)</option>
+                        </select>
+                        <p className="text-xs text-gray-400 mt-1">
+                          {getAlgorithmDescription()}
+                        </p>
+                      </div>
+
+                      <div className="form-control">
+                        <label className="label">
+                          <span className="label-text">Number of Passes</span>
+                        </label>
+                        {algorithm === "Random" ? (
+                          <input
+                            type="number"
+                            min="1"
+                            max="35"
+                            value={passes}
+                            onChange={handlePassesChange}
+                            className="input input-bordered w-full"
+                            disabled={isWiping}
+                          />
+                        ) : (
+                          <div className="text-lg font-semibold">
+                            {passes}
+                          </div>
+                        )}
+                        <p className="text-xs text-gray-400 mt-1">
+                          {algorithm === "Random"
+                            ? "Choose between 1-35 passes"
+                            : `Fixed at ${passes} ${passes === 1 ? "pass" : "passes"}`}
+                        </p>
+                      </div>
+                    </div>
+
                     <button
                       className="btn btn-ghost"
                       onClick={() => {
