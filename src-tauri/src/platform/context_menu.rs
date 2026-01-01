@@ -54,29 +54,9 @@ fn write_context_menu_for_target(root_key: &str, exe_path: &Path) -> Result<(), 
         .set_value("Icon", &exe_path.display().to_string())
         .map_err(|e| ContextMenuError::Registry(e.to_string()))?;
 
-    let shred_key_path = format!("{}\\shell\\Shred", root_key);
-    let (shred_key, _) = hkcu
-        .create_subkey(&shred_key_path)
-        .map_err(|e| ContextMenuError::Registry(e.to_string()))?;
-    shred_key
-        .set_value("MUIVerb", &"Shred")
-        .map_err(|e| ContextMenuError::Registry(e.to_string()))?;
-    shred_key
-        .set_value("Icon", &exe_path.display().to_string())
-        .map_err(|e| ContextMenuError::Registry(e.to_string()))?;
-
-    let algorithm_key_path = format!("{}\\shell\\Shred\\shell\\ChooseShredAlgorithm", root_key);
-    let (algorithm_key, _) = hkcu
-        .create_subkey(&algorithm_key_path)
-        .map_err(|e| ContextMenuError::Registry(e.to_string()))?;
-    algorithm_key
-        .set_value("MUIVerb", &"Choose Shred Algorithm")
-        .map_err(|e| ContextMenuError::Registry(e.to_string()))?;
-    algorithm_key
-        .set_value("Icon", &exe_path.display().to_string())
-        .map_err(|e| ContextMenuError::Registry(e.to_string()))?;
-
-    let command_path = format!("{}\\command", algorithm_key_path);
+    // Directly bind the root entry to the BitBurn context-wipe command so clicking the
+    // top-level menu item launches the app instead of a submenu.
+    let command_path = format!("{}\\command", root_key);
     let (command_key, _) = hkcu
         .create_subkey(&command_path)
         .map_err(|e| ContextMenuError::Registry(e.to_string()))?;

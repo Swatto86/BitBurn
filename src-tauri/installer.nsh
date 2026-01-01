@@ -1,26 +1,18 @@
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
-!include "nsDialogs.nsh"
 !include "FileFunc.nsh"
 
-Var ContextMenuCheckbox
 Var ContextMenuShouldRegister
 
 ; Hook executed before files are copied. Shows the opt-in checkbox.
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro MUI_HEADER_TEXT "Explorer Context Menu" "Add BitBurn -> Shred -> Choose Shred Algorithm to Explorer?"
-  nsDialogs::Create 1018
-  Pop $0
-  ${If} $0 == "error"
-    Abort
-  ${EndIf}
-
-  ${NSD_CreateCheckbox} 0u 0u 100% 12u "Add Explorer context menu entry"
-  Pop $ContextMenuCheckbox
-  ${NSD_Check} $ContextMenuCheckbox
-
-  nsDialogs::Show
-  ${NSD_GetState} $ContextMenuCheckbox $ContextMenuShouldRegister
+  ; Use a simple Yes/No prompt to avoid UI hang scenarios seen with nsDialogs.
+  MessageBox MB_YESNO|MB_ICONQUESTION "Add BitBurn -> Shred -> Choose Shred Algorithm to Explorer?" IDYES +2
+  StrCpy $ContextMenuShouldRegister ${BST_UNCHECKED}
+  Goto done_ctx_prompt
+  StrCpy $ContextMenuShouldRegister ${BST_CHECKED}
+done_ctx_prompt:
 !macroend
 
 ; Hook executed after install finishes. Registers context menu if opted in.
