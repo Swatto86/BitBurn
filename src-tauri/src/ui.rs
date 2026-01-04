@@ -21,13 +21,13 @@ use crate::{
 /// - Centers and resizes the main window to 80% height of the current monitor.
 /// - Hooks close requests to hide the window instead of quitting.
 /// - Builds a tray icon with a Quit menu and click-to-toggle visibility.
-pub fn init_ui(app: &AppHandle) -> tauri::Result<()> {
-    setup_window(app)?;
+pub fn init_ui(app: &AppHandle, launch_hidden: bool) -> tauri::Result<()> {
+    setup_window(app, launch_hidden)?;
     build_tray(app)?;
     Ok(())
 }
 
-fn setup_window(app: &AppHandle) -> tauri::Result<()> {
+fn setup_window(app: &AppHandle, launch_hidden: bool) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window("main") {
         let window_clone = window.clone();
         window.on_window_event(move |event| {
@@ -52,8 +52,12 @@ fn setup_window(app: &AppHandle) -> tauri::Result<()> {
                 }
                 let _ = window_clone.center();
             }
-            let _ = window_clone.show();
-            let _ = window_clone.set_focus();
+            if launch_hidden {
+                let _ = window_clone.hide();
+            } else {
+                let _ = window_clone.show();
+                let _ = window_clone.set_focus();
+            }
         });
     }
 

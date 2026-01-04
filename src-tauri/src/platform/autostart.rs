@@ -2,6 +2,9 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// CLI flag injected into the Run key so autostart launches stay hidden.
+pub const AUTOSTART_FLAG: &str = "--bitburn-autostart";
+
 #[derive(Debug, Error)]
 pub enum AutostartError {
     #[cfg(not(windows))]
@@ -24,13 +27,18 @@ use winreg::{
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 #[cfg(windows)]
+fn autostart_command(exe_path: &Path) -> String {
+    format!("\"{}\" {}", exe_path.display(), AUTOSTART_FLAG)
+}
+
+#[cfg(windows)]
 fn write_autostart(exe_path: &Path) -> Result<(), AutostartError> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (key, _) = hkcu
         .create_subkey_with_flags(RUN_KEY, KEY_WRITE)
         .map_err(|e| AutostartError::Registry(e.to_string()))?;
 
-    let value = exe_path.display().to_string();
+    let value = autostart_command(exe_path);
     key.set_value("BitBurn", &value)
         .map_err(|e| AutostartError::Registry(e.to_string()))?;
     Ok(())
@@ -48,8 +56,15 @@ fn remove_autostart() -> Result<(), AutostartError> {
 #[cfg(windows)]
 fn is_autostart_enabled() -> Result<bool, AutostartError> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    if let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ) {
-        if let Ok::<String, _>(_val) = key.get_value("BitBurn") {
+    if let Ok(key) = hkcu.open_subkey_with_flags(RUN_KEY, KEY_READ | KEY_WRITE) {
+        if let Ok::<String, _>(current_value) = key.get_value("BitBurn") {
+            if let Ok(exe_path) = resolve_executable_path() {
+                let desired_value = autostart_command(&exe_path);
+                if current_value != desired_value {
+                    // Best-effort update to ensure future launches use hidden mode.
+                    let _ = key.set_value("BitBurn", &desired_value);
+                }
+            }
             return Ok(true);
         }
     }
