@@ -24,7 +24,7 @@ use platform::context_menu::{
     register_context_menu,
     unregister_context_menu,
 };
-use platform::autostart::{get_autostart_status, register_autostart, unregister_autostart};
+use platform::autostart::{get_autostart_status, register_autostart, unregister_autostart, AUTOSTART_FLAG};
 
 /// Errors that can occur while securely wiping files.
 #[derive(Debug)]
@@ -902,6 +902,9 @@ fn main() {
         std::process::exit(code);
     }
 
+    let launch_hidden = args.iter().any(|arg| arg == AUTOSTART_FLAG);
+    let initial_args = args.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _| {
@@ -920,10 +923,9 @@ fn main() {
             get_autostart_status,
             platform_info
         ])
-        .setup(|app| {
-            let initial_args: Vec<String> = std::env::args().collect();
+        .setup(move |app| {
             handle_context_invocation(&app.app_handle(), &initial_args);
-            ui::init_ui(&app.app_handle())?;
+            ui::init_ui(&app.app_handle(), launch_hidden)?;
             Ok(())
         })
         .run(tauri::generate_context!())
