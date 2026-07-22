@@ -1,6 +1,6 @@
 [package]
 name = "BitBurn"
-version = "1.0.0"
+version = "1.0.1"
 description = "BitBurn is a secure file and free space wiping utility that implements multiple industry-standard data sanitization algorithms. It provides a user-friendly interface while ensuring thorough data destruction."
 authors = ["Swatto"]
 license = "MIT"
