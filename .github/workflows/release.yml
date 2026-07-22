@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        run: npm run tauri build
+
+      - name: Stage portable exe
+        shell: pwsh
+        run: |
+          $ver = (Get-Content 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json).version
+          $exe = Get-ChildItem 'src-tauri/target/release/*.exe' -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -notlike '*setup*' } |
+                 Sort-Object Length -Descending | Select-Object -First 1
+          if (-not $exe) { throw 'No portable exe in src-tauri/target/release' }
+          $dest = "BitBurn_${ver}_x64-portable.exe"
+          Copy-Item $exe.FullName $dest -Force
+          Write-Host "Staged $dest ($([math]::Round($exe.Length/1MB,1)) MB)"
+          New-Item -ItemType Directory -Force portable | Out-Null
+          Move-Item $dest "portable/$dest" -Force
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+            portable/*.exe
+          draft: false
+          prerelease: false
+          name: BitBurn ${{ github.ref_name }}
+          body: |
+            ## BitBurn ${{ github.ref_name }}
+
+            - **Portable** (`*-portable.exe`) — single exe, no install
+            - **NSIS / MSI installer** — sets up the Explorer context menu
