@@ -1,4 +1,4 @@
-name: windows-ci
+name: ci
 
 on:
   push:
@@ -7,31 +7,32 @@ on:
     branches: [ main, master ]
 
 jobs:
-  test-windows:
-    runs-on: windows-latest
-    timeout-minutes: 20
+  # Pure jsdom React tests (Tauri APIs mocked). Run on Linux: vitest's worker
+  # teardown hangs indefinitely on the windows-latest runner, and these tests
+  # are platform-agnostic (they pass identically + in seconds on Linux).
+  frontend:
+    name: Frontend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npx vitest run
 
-      - name: Set up Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Run frontend tests
-        run: npx vitest run
-
+  # Rust tests genuinely need Windows (registry / context-menu helpers).
+  rust:
+    name: Rust tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - name: Run Rust tests (including Windows registry helpers)
+        working-directory: src-tauri
         env:
           BITBURN_CONTEXT_ROOT: "Software\\Classes\\BitBurnCI"
         run: cargo test --locked
