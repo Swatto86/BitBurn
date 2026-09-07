@@ -6,11 +6,8 @@ Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type @'
 using System;
-using System.Text;
 using System.Runtime.InteropServices;
 public static class NativeDialog {
-    [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr dialog, int id);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
     [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out UIntPtr result);
 }
 '@
@@ -34,16 +31,12 @@ do {
                 }
 
             }
-            # Standard IDYES button in this already-verified test-owned dialog.
-            $handle = [NativeDialog]::GetDlgItem([IntPtr]$window.Current.NativeWindowHandle, 6)
-            $label = New-Object System.Text.StringBuilder 64
-            if ($handle -ne [IntPtr]::Zero) {
-                [void][NativeDialog]::GetWindowText($handle, $label, 64)
-                if ($label.ToString().Replace('&', '') -eq 'Yes') {
-                    $result = [UIntPtr]::Zero
-                    if ([NativeDialog]::SendMessageTimeout($handle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero, 2, 5000, [ref]$result) -eq [IntPtr]::Zero) { throw 'Native Yes button did not respond' }
-                    exit 0
-                }
+            # rfd uses TaskDialogIndirect with the standard IDYES (6).
+            # Task-dialog buttons can have no individual HWND or InvokePattern.
+            if ($buttons.Count -gt 0 -and $window.Current.NativeWindowHandle -ne 0) {
+                $result = [UIntPtr]::Zero
+                if ([NativeDialog]::SendMessageTimeout([IntPtr]$window.Current.NativeWindowHandle, 1126, [IntPtr]6, [IntPtr]::Zero, 2, 5000, [ref]$result) -eq [IntPtr]::Zero) { throw 'Task-dialog Yes button did not respond' }
+                exit 0
             }
         }
     }
