@@ -7,8 +7,8 @@ BitBurn is a modern, secure file and drive wiping utility built with Rust and Ta
 ## Features
 
 - **Multiple Wiping Algorithms:**
-  - NIST 800-88 Clear (1-pass)
-  - NIST 800-88 Purge (3-pass)
+  - Single-pass overwrite (1-pass)
+  - Three-pass overwrite (3-pass)
   - Gutmann (35-pass)
   - Custom Random (1-35 passes)
 
@@ -30,8 +30,8 @@ BitBurn is a modern, secure file and drive wiping utility built with Rust and Ta
 - **Security Features:**
   - Secure random number generation
   - Proper file synchronization
-  - Complete data overwriting
-  - Verification of write operations
+  - Checked overwrite writes and synchronization
+  - Errors reported rather than deleting failed files
 
 - **User Interface:**
   - Modern, intuitive design
@@ -54,18 +54,16 @@ BitBurn is a modern, secure file and drive wiping utility built with Rust and Ta
 
 ## Wiping Algorithms
 
-### NIST 800-88 Clear
+### Single-pass overwrite
 - Single pass with zeros
-- Quick and effective for most modern storage devices
-- Suitable for non-sensitive data
+- Writes zeros to the selected logical file bytes. It cannot reach remapped storage, snapshots or backups.
 
-### NIST 800-88 Purge
+### Three-pass overwrite
 - Three-pass overwrite:
   1. All zeros
   2. All ones
   3. Random data
-- Recommended for sensitive data
-- Provides good balance of security and speed
+- This is a file overwrite, not a NIST Purge operation. Use a device-appropriate sanitization tool for purging media.
 
 ### Gutmann Method
 - 35-pass overwrite with specific patterns
@@ -74,7 +72,7 @@ BitBurn is a modern, secure file and drive wiping utility built with Rust and Ta
   - 4 random passes
   - 27 specific patterns
   - 4 final random passes
-- Maximum security for legacy storage devices
+- A legacy magnetic-media pattern; extra passes do not make SSD sanitization reliable.
 
 ### Random
 - User-configurable number of passes (1-35)
@@ -104,7 +102,7 @@ BitBurn is a modern, secure file and drive wiping utility built with Rust and Ta
 
 ## Security Considerations
 
-- Files erased with BitBurn cannot be recovered
+- Overwriting does not guarantee recovery is impossible: SSD wear levelling, copy-on-write filesystems, snapshots, cloud versions and backups can retain data.
 - Operations cannot be undone
 - Administrator privileges may be required for some operations
 - Network paths are not supported for security reasons
@@ -122,7 +120,7 @@ BitBurn is a modern, secure file and drive wiping utility built with Rust and Ta
 - Uses cryptographically secure random number generation
 - Implements proper file synchronization
 - Includes comprehensive error handling
-- Features atomic operations for data integrity
+- Failed overwrites retain their files; cancellation can leave partially overwritten contents
 - Includes extensive test coverage
 
 ## Development
@@ -135,7 +133,7 @@ Built using:
 
 ## Warning
 
-⚠️ BitBurn is designed to permanently destroy data. Always verify selected files/drives before confirming operations. Wiped data cannot be recovered.
+⚠️ BitBurn is designed to permanently destroy data. Always verify selected files/drives before confirming operations. Treat the selected data as lost after starting; copies elsewhere may survive.
 
 ## Author
 
@@ -150,3 +148,11 @@ BitBurn is licensed under the [MIT License](LICENSE).
 - NIST 800-88 Guidelines for Media Sanitization
 - Peter Gutmann's secure deletion paper
 - The Rust and Tauri communities
+
+## Verification
+
+Run `bash scripts/verify.sh` on Linux after `npm ci`. The full gate includes strict Rust lint, Rust and React regressions, a debug desktop build, and real-webview acceptance with disposable files. The desktop suite requires `tauri-driver`, a matching platform WebDriver, and `xdotool` on Linux. Close other BitBurn instances before running it.
+
+Free-space wiping keeps a 64 MiB reserve and cleans up its anonymous temporary file on ordinary success, failure and cancellation. Abrupt process termination or power loss can still interrupt writes.
+
+The names `NistClear` and `NistPurge` remain internal compatibility identifiers; they are not certification claims. See [NIST SP 800-88 Rev. 2](https://csrc.nist.gov/pubs/sp/800/88/r2/final) for media-sanitization guidance.

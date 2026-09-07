@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Desktop acceptance diagnostics
+e2e-failure.*

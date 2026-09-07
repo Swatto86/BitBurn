@@ -4,27 +4,27 @@
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::fs::{self, OpenOptions};
+use std::fmt;
+use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use tauri::{Emitter, Listener, Manager, Runtime};
-use tauri::async_runtime::spawn_blocking;
-use walkdir::WalkDir;
-use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use sysinfo::{DiskExt, System, SystemExt};
+use tauri::async_runtime::spawn_blocking;
+use tauri::{Emitter, Listener, Manager, Runtime};
+use walkdir::WalkDir;
 mod platform;
+mod safety;
 mod ui;
 
-use platform::context_menu::{
-    get_context_menu_status,
-    handle_context_invocation,
-    process_cli_side_effects,
-    register_context_menu,
-    unregister_context_menu,
+use platform::autostart::{
+    get_autostart_status, register_autostart, unregister_autostart, AUTOSTART_FLAG,
 };
-use platform::autostart::{get_autostart_status, register_autostart, unregister_autostart, AUTOSTART_FLAG};
+use platform::context_menu::{
+    get_context_menu_status, handle_context_invocation, process_cli_side_effects,
+    register_context_menu, unregister_context_menu,
+};
 
 /// Errors that can occur while securely wiping files.
 #[derive(Debug)]
@@ -57,10 +57,10 @@ impl std::error::Error for WipeError {
 /// Each variant maps to a specific pass count and pattern strategy enforced in the backend.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum WipeAlgorithm {
-    NistClear,      // NIST 800-88 Clear: 1 pass zeros (replaces Basic)
-    NistPurge,      // NIST 800-88 Purge: 3 pass overwrite (replaces DOD)
-    Gutmann,        // 35 pass: Gutmann pattern (kept for legacy/specific needs)
-    Random,         // N passes of random data (replaces DOD_E and custom needs)
+    NistClear, // Single-pass overwrite: 1 pass zeros (replaces Basic)
+    NistPurge, // Three-pass overwrite: 3 pass overwrite (replaces DOD)
+    Gutmann,   // 35 pass: Gutmann pattern (kept for legacy/specific needs)
+    Random,    // N passes of random data (replaces DOD_E and custom needs)
 }
 
 /// Progress payload emitted to the UI during wipe operations.
@@ -93,7 +93,9 @@ impl WipeProgress {
     fn update(&mut self, bytes_processed: u64, pattern: &str) {
         self.bytes_processed = bytes_processed;
         self.current_pattern = pattern.to_string();
-        if let Some(est_total) = self.estimated_total_bytes {
+        if self.estimated_total_bytes.unwrap_or(self.total_bytes) == 0 {
+            self.percentage = 100.0;
+        } else if let Some(est_total) = self.estimated_total_bytes {
             self.percentage = (bytes_processed as f32 / est_total as f32) * 100.0;
         } else {
             self.percentage = (bytes_processed as f32 / self.total_bytes as f32) * 100.0;
@@ -151,18 +153,40 @@ pub struct PlatformInfo {
     os: String,
 }
 
-
-fn secure_wipe_file<F>(path: &Path, passes: u32, algorithm: &WipeAlgorithm, mut progress_callback: F) -> Result<(), WipeError>
+#[cfg(test)]
+fn secure_wipe_file<F>(
+    path: &Path,
+    passes: u32,
+    algorithm: &WipeAlgorithm,
+    progress_callback: F,
+) -> Result<(), WipeError>
 where
     F: FnMut(WipeProgress),
 {
-    let cancelled = Arc::new(AtomicBool::new(false));
+    secure_wipe_file_cancellable(
+        path,
+        passes,
+        algorithm,
+        &AtomicBool::new(false),
+        progress_callback,
+    )
+}
 
+fn secure_wipe_file_cancellable<F>(
+    path: &Path,
+    passes: u32,
+    algorithm: &WipeAlgorithm,
+    cancelled: &AtomicBool,
+    progress_callback: F,
+) -> Result<(), WipeError>
+where
+    F: FnMut(WipeProgress),
+{
     let check_cancelled = || {
         if cancelled.load(Ordering::SeqCst) {
             return Err(WipeError::Io(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
-                "Operation cancelled by user"
+                "Operation cancelled by user",
             )));
         }
         Ok(())
@@ -171,7 +195,7 @@ where
     if path.is_symlink() {
         return Err(WipeError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "Cannot wipe symbolic links"
+            "Cannot wipe symbolic links",
         )));
     }
 
@@ -179,50 +203,63 @@ where
         return Err(WipeError::PathNotFound);
     }
 
-    if passes == 0 {
+    if !(1..=35).contains(&passes) {
         return Err(WipeError::InvalidPasses);
     }
 
-    // Try to open file with minimal permissions first to check access
-    match OpenOptions::new().write(true).open(path) {
-        Ok(_) => {},
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                return Err(WipeError::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Access denied. The file might be in use or require administrator privileges."
-                )));
-            }
-            return Err(WipeError::Io(e));
+    check_cancelled()?;
+
+    let mut target = safety::WipeFile::open(path).map_err(WipeError::Io)?;
+    overwrite_file(
+        &mut target.file,
+        passes,
+        algorithm,
+        cancelled,
+        progress_callback,
+    )?;
+    check_cancelled()?;
+    target.remove().map_err(WipeError::Io)
+}
+
+fn overwrite_file<F>(
+    file: &mut fs::File,
+    passes: u32,
+    algorithm: &WipeAlgorithm,
+    cancelled: &AtomicBool,
+    mut progress_callback: F,
+) -> Result<(), WipeError>
+where
+    F: FnMut(WipeProgress),
+{
+    let check_cancelled = || {
+        if cancelled.load(Ordering::SeqCst) {
+            Err(WipeError::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Operation cancelled by user",
+            )))
+        } else {
+            Ok(())
         }
-    }
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .read(true)
-        .open(path)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                WipeError::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Access denied. The file might be in use or require administrator privileges."
-                ))
-            } else {
-                WipeError::Io(e)
-            }
-        })?;
-
+    };
+    check_cancelled()?;
+    let passes = match algorithm {
+        WipeAlgorithm::NistClear => 1,
+        WipeAlgorithm::NistPurge => 3,
+        WipeAlgorithm::Gutmann => 35,
+        WipeAlgorithm::Random => passes,
+    };
+    file.seek(SeekFrom::Start(0)).map_err(WipeError::Io)?;
     let file_size = file.metadata().map_err(WipeError::Io)?.len();
     let mut rng = rand::thread_rng();
     let mut progress = WipeProgress::new(
         passes,
         file_size,
         match algorithm {
-            WipeAlgorithm::NistClear => "NIST 800-88 Clear",
-            WipeAlgorithm::NistPurge => "NIST 800-88 Purge",
+            WipeAlgorithm::NistClear => "Single-pass overwrite",
+            WipeAlgorithm::NistPurge => "Three-pass overwrite",
             WipeAlgorithm::Gutmann => "Gutmann",
             WipeAlgorithm::Random => "Random",
-        }
+        },
     );
 
     // Increase buffer size to 1MB for better performance and smooth updates
@@ -232,48 +269,54 @@ where
 
     match algorithm {
         WipeAlgorithm::NistClear => {
-            // NIST 800-88 Clear: Single pass with zeros
-            progress.update(0, "NIST 800-88 Clear - Writing zeros");
+            // Single-pass overwrite: Single pass with zeros
+            progress.update(0, "Single-pass overwrite - Writing zeros");
             progress_callback(progress.clone());
 
             let buffer = vec![0u8; BUFFER_SIZE as usize];
             for chunk_start in (0..file_size).step_by(BUFFER_SIZE as usize) {
                 check_cancelled()?;
                 let chunk_size = std::cmp::min(BUFFER_SIZE, file_size - chunk_start);
-                file.write_all(&buffer[..chunk_size as usize]).map_err(WipeError::Io)?;
+                file.write_all(&buffer[..chunk_size as usize])
+                    .map_err(WipeError::Io)?;
 
                 // Update progress at most every 16ms for smooth animation
                 if last_progress_update.elapsed() >= progress_update_interval {
                     progress.update(
                         chunk_start + chunk_size,
-                        &format!("NIST 800-88 Clear - Writing zeros ({:.2} MB / {:.2} MB)",
+                        &format!(
+                            "Single-pass overwrite - Writing zeros ({:.2} MB / {:.2} MB)",
                             (chunk_start + chunk_size) as f64 / 1024.0 / 1024.0,
                             file_size as f64 / 1024.0 / 1024.0
-                        )
+                        ),
                     );
                     progress_callback(progress.clone());
                     last_progress_update = std::time::Instant::now();
                 }
             }
             file.sync_all().map_err(WipeError::Io)?;
-            
+
             // Final cleanup
             check_cancelled()?;
-            progress.update(file_size, "Finalizing NIST 800-88 Clear wipe");
+            progress.update(file_size, "Finalizing Single-pass overwrite wipe");
             progress_callback(progress);
-        },
+        }
         WipeAlgorithm::NistPurge => {
-            // NIST 800-88 Purge: Three-pass overwrite
+            // Three-pass overwrite: Three-pass overwrite
             let patterns = [
                 (0x00, false, "zeros"),
                 (0xFF, false, "ones"),
-                (0x00, true, "random data")
+                (0x00, true, "random data"),
             ];
 
             for (pass, &(pattern, is_random, pattern_type)) in patterns.iter().enumerate() {
                 check_cancelled()?;
                 progress.current_pass = (pass + 1) as u32;
-                let desc = format!("NIST 800-88 Purge - Writing {} (Pass {}/3)", pattern_type, pass + 1);
+                let desc = format!(
+                    "Three-pass overwrite - Writing {} (Pass {}/3)",
+                    pattern_type,
+                    pass + 1
+                );
                 progress.update(0, &desc);
                 progress_callback(progress.clone());
 
@@ -286,18 +329,20 @@ where
                     if is_random {
                         rng.fill_bytes(&mut buffer[..chunk_size as usize]);
                     }
-                    file.write_all(&buffer[..chunk_size as usize]).map_err(WipeError::Io)?;
+                    file.write_all(&buffer[..chunk_size as usize])
+                        .map_err(WipeError::Io)?;
 
                     // Update progress at most every 16ms for smooth animation
                     if last_progress_update.elapsed() >= progress_update_interval {
                         progress.update(
                             chunk_start + chunk_size,
-                            &format!("NIST 800-88 Purge - Writing {} (Pass {}/3) - {:.2} MB / {:.2} MB",
+                            &format!(
+                                "Three-pass overwrite - Writing {} (Pass {}/3) - {:.2} MB / {:.2} MB",
                                 pattern_type,
                                 pass + 1,
                                 (chunk_start + chunk_size) as f64 / 1024.0 / 1024.0,
                                 file_size as f64 / 1024.0 / 1024.0
-                            )
+                            ),
                         );
                         progress_callback(progress.clone());
                         last_progress_update = std::time::Instant::now();
@@ -305,12 +350,12 @@ where
                 }
                 file.sync_all().map_err(WipeError::Io)?;
             }
-            
+
             // Final cleanup
             check_cancelled()?;
-            progress.update(file_size, "Finalizing NIST 800-88 Purge wipe");
+            progress.update(file_size, "Finalizing Three-pass overwrite wipe");
             progress_callback(progress);
-        },
+        }
         WipeAlgorithm::Gutmann => {
             // Gutmann 35-pass pattern
             // Reference: https://en.wikipedia.org/wiki/Gutmann_method
@@ -320,13 +365,24 @@ where
                 (vec![0x00], true, "Random data (Pass 2/35)"),
                 (vec![0x00], true, "Random data (Pass 3/35)"),
                 (vec![0x00], true, "Random data (Pass 4/35)"),
-                
                 // Passes 5-31: Fixed patterns
-                (vec![0x55, 0xAA, 0x55, 0xAA], false, "Pattern 5/35: 0x55 0xAA"),
-                (vec![0xAA, 0x55, 0xAA, 0x55], false, "Pattern 6/35: 0xAA 0x55"),
-                (vec![0x92, 0x49, 0x24], false, "Pattern 7/35: 0x92 0x49 0x24"),
-                (vec![0x49, 0x24, 0x92], false, "Pattern 8/35: 0x49 0x24 0x92"),
-                (vec![0x24, 0x92, 0x49], false, "Pattern 9/35: 0x24 0x92 0x49"),
+                (vec![0x55], false, "Pattern 5/35: 0x55"),
+                (vec![0xAA], false, "Pattern 6/35: 0xAA"),
+                (
+                    vec![0x92, 0x49, 0x24],
+                    false,
+                    "Pattern 7/35: 0x92 0x49 0x24",
+                ),
+                (
+                    vec![0x49, 0x24, 0x92],
+                    false,
+                    "Pattern 8/35: 0x49 0x24 0x92",
+                ),
+                (
+                    vec![0x24, 0x92, 0x49],
+                    false,
+                    "Pattern 9/35: 0x24 0x92 0x49",
+                ),
                 (vec![0x00], false, "Pattern 10/35: 0x00"),
                 (vec![0x11], false, "Pattern 11/35: 0x11"),
                 (vec![0x22], false, "Pattern 12/35: 0x22"),
@@ -343,18 +399,41 @@ where
                 (vec![0xDD], false, "Pattern 23/35: 0xDD"),
                 (vec![0xEE], false, "Pattern 24/35: 0xEE"),
                 (vec![0xFF], false, "Pattern 25/35: 0xFF"),
-                (vec![0x92, 0x49, 0x24], false, "Pattern 26/35: 0x92 0x49 0x24"),
-                (vec![0x49, 0x24, 0x92], false, "Pattern 27/35: 0x49 0x24 0x92"),
-                (vec![0x24, 0x92, 0x49], false, "Pattern 28/35: 0x24 0x92 0x49"),
-                (vec![0x6D, 0xB6, 0xDB], false, "Pattern 29/35: 0x6D 0xB6 0xDB"),
-                (vec![0xB6, 0xDB, 0x6D], false, "Pattern 30/35: 0xB6 0xDB 0x6D"),
-                (vec![0xDB, 0x6D, 0xB6], false, "Pattern 31/35: 0xDB 0x6D 0xB6"),
-                
+                (
+                    vec![0x92, 0x49, 0x24],
+                    false,
+                    "Pattern 26/35: 0x92 0x49 0x24",
+                ),
+                (
+                    vec![0x49, 0x24, 0x92],
+                    false,
+                    "Pattern 27/35: 0x49 0x24 0x92",
+                ),
+                (
+                    vec![0x24, 0x92, 0x49],
+                    false,
+                    "Pattern 28/35: 0x24 0x92 0x49",
+                ),
+                (
+                    vec![0x6D, 0xB6, 0xDB],
+                    false,
+                    "Pattern 29/35: 0x6D 0xB6 0xDB",
+                ),
+                (
+                    vec![0xB6, 0xDB, 0x6D],
+                    false,
+                    "Pattern 30/35: 0xB6 0xDB 0x6D",
+                ),
+                (
+                    vec![0xDB, 0x6D, 0xB6],
+                    false,
+                    "Pattern 31/35: 0xDB 0x6D 0xB6",
+                ),
                 // Passes 32-35: Random
                 (vec![0x00], true, "Random data (Pass 32/35)"),
                 (vec![0x00], true, "Random data (Pass 33/35)"),
                 (vec![0x00], true, "Random data (Pass 34/35)"),
-                (vec![0x00], true, "Random data (Pass 35/35)")
+                (vec![0x00], true, "Random data (Pass 35/35)"),
             ];
 
             for (pass, &(ref pattern, is_random, desc)) in patterns.iter().enumerate() {
@@ -369,27 +448,33 @@ where
                 for chunk_start in (0..file_size).step_by(BUFFER_SIZE as usize) {
                     check_cancelled()?;
                     let chunk_size = std::cmp::min(BUFFER_SIZE, file_size - chunk_start) as usize;
-                    
+
                     if is_random {
                         rng.fill_bytes(&mut buffer[..chunk_size]);
                     } else {
                         // Fill the buffer with the repeating pattern
                         for i in 0..chunk_size {
-                            buffer[i] = pattern[i % pattern.len()];
+                            buffer[i] =
+                                pattern[(usize::try_from(chunk_start % pattern.len() as u64)
+                                    .map_err(|_| WipeError::InvalidPasses)?
+                                    + i)
+                                    % pattern.len()];
                         }
                     }
-                    
-                    file.write_all(&buffer[..chunk_size]).map_err(WipeError::Io)?;
+
+                    file.write_all(&buffer[..chunk_size])
+                        .map_err(WipeError::Io)?;
 
                     // Update progress at most every 16ms for smooth animation
                     if last_progress_update.elapsed() >= progress_update_interval {
                         progress.update(
                             chunk_start + chunk_size as u64,
-                            &format!("{} - {:.2} MB / {:.2} MB",
+                            &format!(
+                                "{} - {:.2} MB / {:.2} MB",
                                 desc,
                                 (chunk_start + chunk_size as u64) as f64 / 1024.0 / 1024.0,
                                 file_size as f64 / 1024.0 / 1024.0
-                            )
+                            ),
                         );
                         progress_callback(progress.clone());
                         last_progress_update = std::time::Instant::now();
@@ -397,12 +482,12 @@ where
                 }
                 file.sync_all().map_err(WipeError::Io)?;
             }
-            
+
             // Final cleanup
             check_cancelled()?;
             progress.update(file_size, "Finalizing Gutmann wipe");
             progress_callback(progress);
-        },
+        }
         WipeAlgorithm::Random => {
             for pass in 1..=passes {
                 check_cancelled()?;
@@ -417,18 +502,20 @@ where
                     check_cancelled()?;
                     let chunk_size = std::cmp::min(BUFFER_SIZE, file_size - chunk_start);
                     rng.fill_bytes(&mut buffer[..chunk_size as usize]);
-                    file.write_all(&buffer[..chunk_size as usize]).map_err(WipeError::Io)?;
+                    file.write_all(&buffer[..chunk_size as usize])
+                        .map_err(WipeError::Io)?;
 
                     // Update progress at most every 16ms for smooth animation
                     if last_progress_update.elapsed() >= progress_update_interval {
                         progress.update(
                             chunk_start + chunk_size,
-                            &format!("Writing random data (Pass {}/{}) - {:.2} MB / {:.2} MB",
+                            &format!(
+                                "Writing random data (Pass {}/{}) - {:.2} MB / {:.2} MB",
                                 pass,
                                 passes,
                                 (chunk_start + chunk_size) as f64 / 1024.0 / 1024.0,
                                 file_size as f64 / 1024.0 / 1024.0
-                            )
+                            ),
                         );
                         progress_callback(progress.clone());
                         last_progress_update = std::time::Instant::now();
@@ -436,19 +523,17 @@ where
                 }
                 file.sync_all().map_err(WipeError::Io)?;
             }
-            
+
             // Final cleanup
             check_cancelled()?;
             progress.update(file_size, "Finalizing random wipe");
             progress_callback(progress);
-        },
+        }
     }
 
     // Final cleanup
     check_cancelled()?;
-    file.set_len(0).map_err(WipeError::Io)?;
-    drop(file);
-    fs::remove_file(path).map_err(WipeError::Io)?;
+    file.sync_all().map_err(WipeError::Io)?;
 
     Ok(())
 }
@@ -474,8 +559,12 @@ fn validate_drive_path_internal(path: &Path) -> Result<(), DriveValidationError>
         return Err(DriveValidationError::PathNotFound);
     }
 
-    // Check if it's a drive root (e.g., "C:\")
-    if path.to_string_lossy().matches('\\').count() != 1 {
+    if safety::validate_path(path).is_err() || !path.is_dir() {
+        return Err(DriveValidationError::NotDriveRoot);
+    }
+    let mut system = System::new();
+    system.refresh_disks_list();
+    if !system.disks().iter().any(|disk| disk.mount_point() == path) {
         return Err(DriveValidationError::NotDriveRoot);
     }
 
@@ -487,17 +576,23 @@ fn validate_drive_path_internal(path: &Path) -> Result<(), DriveValidationError>
 #[tauri::command]
 async fn validate_drive_path(path: String) -> Result<WipeResult, String> {
     let path = Path::new(&path);
-    
+
     match validate_drive_path_internal(path) {
         Ok(_) => {
-            log_event("validate_drive_path", json!({"status": "success", "path": path.to_string_lossy()}));
+            log_event(
+                "validate_drive_path",
+                json!({"status": "success", "path": path.to_string_lossy()}),
+            );
             Ok(WipeResult {
                 success: true,
                 message: "Path validation successful".to_string(),
             })
         }
         Err(e) => {
-            log_event("validate_drive_path", json!({"status": "error", "path": path.to_string_lossy(), "message": e.to_string()}));
+            log_event(
+                "validate_drive_path",
+                json!({"status": "error", "path": path.to_string_lossy(), "message": e.to_string()}),
+            );
             Ok(WipeResult {
                 success: false,
                 message: e.to_string(),
@@ -514,33 +609,112 @@ async fn show_confirmation_dialog<R: Runtime>(
     path: String,
     algorithm: String,
     description: String,
+    operation: Option<String>,
+    paths: Option<Vec<String>>,
+    passes: Option<u32>,
 ) -> Result<bool, String> {
     use tauri_plugin_dialog::DialogExt;
 
-    let message = if path.contains('\n') {
+    let kind = operation.unwrap_or_else(|| {
+        if path.contains('\n') {
+            "files".into()
+        } else {
+            "freespace".into()
+        }
+    });
+    let paths = paths.unwrap_or_else(|| vec![path.clone()]);
+    if paths.is_empty() || !matches!(kind.as_str(), "files" | "freespace") {
+        return Err("Select files or a drive to confirm".into());
+    }
+    let passes = passes.unwrap_or(1);
+    if !(1..=35).contains(&passes) {
+        return Err("Pass count must be between 1 and 35".into());
+    }
+    let _ = description; // The backend describes the operation rather than trusting UI text.
+    let description = match algorithm.as_str() {
+        "NistClear" => "Single pass of zeros".into(),
+        "NistPurge" => "Three passes: zeros, ones, random data".into(),
+        "Gutmann" => "35-pass legacy magnetic-media pattern".into(),
+        "Random" => format!("{} passes of random data", passes),
+        _ => return Err("Unsupported overwrite algorithm".into()),
+    };
+    let request = safety::Request {
+        paths: paths.clone(),
+        algorithm: algorithm.clone(),
+        passes,
+        operation: kind.clone(),
+        window: window.label().to_owned(),
+    };
+    let path = paths
+        .iter()
+        .map(|path| format!("{:?}", path))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let message = if kind == "files" {
         // File wiping confirmation
-        let file_count = path.lines().count();
+        let file_count = paths.len();
         format!(
-            "You are about to permanently erase {} file(s) using:\n\nAlgorithm: {}\nDescription: {}\n\nTHIS ACTION CANNOT BE UNDONE!\n\nAre you absolutely sure you want to continue?",
+            "You are about to permanently erase {} file(s) using:\n\nAlgorithm: {}\nDescription: {}\n\nSelected paths:\n{path}\n\nTHIS ACTION CANNOT BE UNDONE!\n\nAre you absolutely sure you want to continue?",
             file_count, algorithm, description
         )
     } else {
         // Drive wiping confirmation
         format!(
-            "You are about to wipe all free space on the selected drive using:\n\nAlgorithm: {}\nDescription: {}\n\nTHIS ACTION CANNOT BE UNDONE!\n\nAre you absolutely sure you want to continue?",
+            "You are about to wipe all free space on the selected drive using:\n\nAlgorithm: {}\nDescription: {}\n\nSelected paths:\n{path}\n\nTHIS ACTION CANNOT BE UNDONE!\n\nAre you absolutely sure you want to continue?",
             algorithm, description
         )
     };
 
-    let confirmed = window
-        .dialog()
-        .message(&message)
-        .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
-        .title("⚠️ WARNING ⚠️")
-        .buttons(tauri_plugin_dialog::MessageDialogButtons::YesNo)
-        .blocking_show();
-
+    let confirmed = spawn_blocking(move || {
+        window
+            .dialog()
+            .message(&message)
+            .kind(tauri_plugin_dialog::MessageDialogKind::Warning)
+            .title("⚠️ WARNING ⚠️")
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::YesNo)
+            .blocking_show()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if confirmed {
+        safety::remember_confirmation(request)?;
+    }
     Ok(confirmed)
+}
+
+#[tauri::command]
+async fn get_file_size(path: String) -> Result<u64, String> {
+    spawn_blocking(move || {
+        let path = Path::new(&path);
+        safety::validate_path(path).map_err(|e| e.to_string())?;
+        fs::metadata(path)
+            .map(|m| m.len())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn show_size_warning_dialog<R: Runtime>(
+    window: tauri::Window<R>,
+    path: String,
+    size: u64,
+) -> Result<bool, String> {
+    use tauri_plugin_dialog::DialogExt;
+    spawn_blocking(move || {
+        window
+            .dialog()
+            .message(format!(
+                "{} is {:.1} GiB. Overwriting may take a long time. Continue?",
+                path,
+                size as f64 / 1073741824.0
+            ))
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::YesNo)
+            .blocking_show()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Report platform information to the frontend for capability gating.
@@ -587,21 +761,34 @@ async fn execute_free_space_wipe<R: Runtime>(
     window: tauri::Window<R>,
     path: String,
     algorithm: WipeAlgorithm,
-    passes: u32
+    passes: u32,
 ) -> Result<WipeResult, String> {
+    if !(1..=35).contains(&passes) {
+        return Err("Pass count must be between 1 and 35".into());
+    }
+    let operation = safety::Operation::acquire()?;
+    safety::consume_confirmation(safety::Request {
+        paths: vec![path.clone()],
+        algorithm: format!("{:?}", algorithm),
+        passes,
+        operation: "freespace".into(),
+        window: window.label().into(),
+    })?;
     let window_label = window.label().to_string();
     let app_handle = window.app_handle().clone();
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancel_for_listener = cancelled.clone();
 
-    let _cancel_listener = app_handle.listen("cancel_operation", move |_| {
+    let cancel_listener = app_handle.listen("cancel_operation", move |_| {
         cancel_for_listener.store(true, Ordering::SeqCst);
     });
 
     let path_buf = PathBuf::from(path);
     let algo_for_task = algorithm.clone();
 
+    let listener_handle = app_handle.clone();
     let join_result = spawn_blocking(move || {
+        let _operation = operation;
         let path = path_buf;
 
         log_event(
@@ -620,7 +807,7 @@ async fn execute_free_space_wipe<R: Runtime>(
         let disk_info = sys
             .disks()
             .iter()
-            .find(|disk| path.starts_with(disk.mount_point()))
+            .find(|disk| path == disk.mount_point())
             .ok_or_else(|| "Could not find disk information".to_string())?;
 
         let available_space = disk_info.available_space();
@@ -637,8 +824,8 @@ async fn execute_free_space_wipe<R: Runtime>(
             passes,
             0,
             match algo_for_task {
-                WipeAlgorithm::NistClear => "NIST 800-88 Clear",
-                WipeAlgorithm::NistPurge => "NIST 800-88 Purge",
+                WipeAlgorithm::NistClear => "Single-pass overwrite",
+                WipeAlgorithm::NistPurge => "Three-pass overwrite",
                 WipeAlgorithm::Gutmann => "Gutmann",
                 WipeAlgorithm::Random => "Random",
             },
@@ -649,119 +836,46 @@ async fn execute_free_space_wipe<R: Runtime>(
         progress.update(0, "Filling drive space");
         progress_callback(progress.clone());
 
-        let temp_file_path = path.join(".temp_wipe_file");
-
-        if temp_file_path.exists() {
-            progress.update(0, "Cleaning up previous temporary file");
-            progress_callback(progress.clone());
-            if let Err(e) = fs::remove_file(&temp_file_path) {
-                return Ok(free_space_error_result(format!(
-                    "Failed to remove existing temporary file: {}",
-                    e
-                )));
-            }
+        // Anonymous temporary file: unique creation and cleanup on every return path,
+        // using the same handle for filling and overwriting (no path reopening).
+        let mut file = tempfile::tempfile_in(&path).map_err(|e| format!("Cannot create temporary file: {}", e))?;
+        const RESERVE: u64 = 64 * 1024 * 1024;
+        let budget = available_space.saturating_sub(RESERVE);
+        if budget == 0 {
+            return Ok(free_space_error_result("Not enough free space; 64 MiB must remain available"));
         }
-
-        let mut file = match OpenOptions::new().write(true).create(true).open(&temp_file_path) {
-            Ok(f) => f,
-            Err(e) => {
-                return Ok(free_space_error_result(format!(
-                    "Failed to create temporary file: {}",
-                    e
-                )));
-            }
-        };
-
-        let chunk_size = 1024 * 1024; // 1MB chunks
-        let mut buffer = vec![0u8; chunk_size];
+        let mut buffer = vec![0u8; 1024 * 1024];
         let mut rng = rand::thread_rng();
         let mut total_written = 0u64;
-        let mut last_refresh = std::time::Instant::now();
-        let mut last_space_used = 0u64;
-
-        loop {
-            if cancelled.load(Ordering::SeqCst) {
-                let _ = file.sync_all();
-                let _ = fs::remove_file(&temp_file_path);
-                return Ok(cancelled_wipe_result());
+        while total_written < budget {
+            if cancelled.load(Ordering::SeqCst) { return Ok(cancelled_wipe_result()); }
+            sys.refresh_disks();
+            let free = sys.disks().iter().find(|disk| disk.mount_point() == path)
+                .ok_or_else(|| "Selected drive disappeared".to_string())?.available_space();
+            let remaining = budget.saturating_sub(total_written).min(free.saturating_sub(RESERVE));
+            if remaining == 0 { break; }
+            let length = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|e| e.to_string())?;
+            rng.fill_bytes(&mut buffer[..length]);
+            match file.write_all(&buffer[..length]) {
+                Ok(()) => total_written += length as u64,
+                Err(error) if error.kind() == io::ErrorKind::StorageFull => break,
+                Err(error) => return Ok(free_space_error_result(format!("Temporary write failed: {}", error))),
             }
-
-            if last_refresh.elapsed() >= std::time::Duration::from_millis(100) {
-                sys.refresh_disks_list();
-                if let Some(disk) = sys.disks().iter().find(|disk| path.starts_with(disk.mount_point())) {
-                    let current_available = disk.available_space();
-                    last_space_used = available_space - current_available;
-                }
-                last_refresh = std::time::Instant::now();
-            }
-
-            rng.fill_bytes(&mut buffer);
-            match file.write_all(&buffer) {
-                Ok(_) => {
-                    total_written += chunk_size as u64;
-                    progress.update(last_space_used, &format!("Filling drive space ({} MB written)", total_written / 1024 / 1024));
-                    progress_callback(progress.clone());
-
-                    if total_written % (10 * chunk_size as u64) == 0 {
-                        if let Err(_) = file.sync_all() {
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::StorageFull
-                        || e.kind() == io::ErrorKind::OutOfMemory
-                        || e.kind() == io::ErrorKind::WriteZero
-                    {
-                        sys.refresh_disks_list();
-                        if let Some(disk) = sys.disks().iter().find(|disk| path.starts_with(disk.mount_point())) {
-                            let current_available = disk.available_space();
-                            let space_used = available_space - current_available;
-                            progress.update(space_used, "Drive space filled");
-                            progress_callback(progress.clone());
-                        }
-                        break;
-                    }
-                    let _ = fs::remove_file(&temp_file_path);
-                    return Ok(free_space_error_result(format!(
-                        "Failed to write to temporary file: {}",
-                        e
-                    )));
-                }
-            }
+            progress.update(total_written, "Filling free space (64 MiB reserved)");
+            progress_callback(progress.clone());
+        }
+        file.sync_all().map_err(|e| format!("Temporary file sync failed: {}", e))?;
+        file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        match overwrite_file(&mut file, passes, &algo_for_task, &cancelled, progress_callback) {
+            Ok(()) => Ok(WipeResult { success: true, message: "Free-space overwrite completed; 64 MiB reserved. SSDs, snapshots and backups may retain data.".into() }),
+            Err(WipeError::Io(error)) if error.kind() == io::ErrorKind::Interrupted => Ok(cancelled_wipe_result()),
+            Err(error) => Ok(free_space_error_result(format!("Free-space overwrite failed: {}", error))),
         }
 
-        progress.total_bytes = total_written;
-        let cancelled_clone = cancelled.clone();
-        match secure_wipe_file(&temp_file_path, passes, &algo_for_task, move |p| {
-            if !cancelled_clone.load(Ordering::SeqCst) {
-                progress_callback(p);
-            }
-        }) {
-            Ok(_) => {
-                if cancelled.load(Ordering::SeqCst) {
-                    log_event("wipe_free_space_cancelled", json!({"path": path.to_string_lossy()}));
-                    Ok(cancelled_wipe_result())
-                } else {
-                    log_event("wipe_free_space_complete", json!({"path": path.to_string_lossy(), "status": "success"}));
-                    Ok(WipeResult {
-                        success: true,
-                        message: "Successfully wiped free space".to_string(),
-                    })
-                }
-            }
-            Err(e) => {
-                let _ = fs::remove_file(&temp_file_path);
-                log_event(
-                    "wipe_free_space_error",
-                    json!({"path": path.to_string_lossy(), "message": format!("{}", e)}),
-                );
-                Ok(free_space_error_result(format!("Failed to wipe free space: {}", e)))
-            }
-        }
     })
-    .await
-    .map_err(|e| format!("wipe_free_space task join error: {}", e))?;
+    .await;
+    listener_handle.unlisten(cancel_listener);
+    let join_result = join_result.map_err(|e| format!("wipe_free_space task join error: {}", e))?;
 
     join_result
 }
@@ -773,21 +887,34 @@ async fn wipe_files<R: Runtime>(
     window: tauri::Window<R>,
     paths: Vec<String>,
     passes: u32,
-    algorithm: WipeAlgorithm
+    algorithm: WipeAlgorithm,
 ) -> Result<WipeResult, String> {
+    if !(1..=35).contains(&passes) {
+        return Err("Pass count must be between 1 and 35".into());
+    }
+    let operation = safety::Operation::acquire()?;
+    safety::consume_confirmation(safety::Request {
+        paths: paths.clone(),
+        algorithm: format!("{:?}", algorithm),
+        passes,
+        operation: "files".into(),
+        window: window.label().into(),
+    })?;
     let window_label = window.label().to_string();
     let app_handle = window.app_handle().clone();
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancel_for_listener = cancelled.clone();
 
-    let _cancel_listener = app_handle.listen("cancel_operation", move |_| {
+    let cancel_listener = app_handle.listen("cancel_operation", move |_| {
         cancel_for_listener.store(true, Ordering::SeqCst);
     });
 
     let paths_for_task = paths.clone();
     let algo_for_task = algorithm.clone();
 
+    let listener_handle = app_handle.clone();
     let join_result = spawn_blocking(move || {
+        let _operation = operation;
         log_event(
             "wipe_files_start",
             json!({"count": paths_for_task.len(), "algorithm": format!("{:?}", algo_for_task), "passes": passes}),
@@ -803,6 +930,10 @@ async fn wipe_files<R: Runtime>(
 
             let path = Path::new(&path_str);
 
+            if let Err(error) = safety::validate_path(path) {
+                failed_files.push(format!("Invalid path {}: {}", path_str, error));
+                continue;
+            }
             if !path.exists() {
                 failed_files.push(format!("Path not found: {}", path_str));
                 continue;
@@ -820,14 +951,20 @@ async fn wipe_files<R: Runtime>(
             };
 
             if path.is_file() {
-                match secure_wipe_file(path, passes, &algo_for_task, emit_progress) {
+                match secure_wipe_file_cancellable(path, passes, &algo_for_task, &cancelled, emit_progress) {
                     Ok(_) => total_files += 1,
                     Err(e) => failed_files.push(format!("Failed to wipe {}: {}", path_str, e)),
                 }
             } else if path.is_dir() {
                 let files: Vec<_> = WalkDir::new(path)
                     .into_iter()
-                    .filter_map(|e| e.ok())
+                    .filter_map(|entry| match entry {
+                        Ok(entry) => Some(entry),
+                        Err(error) => {
+                            failed_files.push(format!("Directory traversal failed: {}", error));
+                            None
+                        }
+                    })
                     .filter(|e| e.file_type().is_file())
                     .collect();
 
@@ -850,15 +987,15 @@ async fn wipe_files<R: Runtime>(
                         }
                     };
 
-                    match secure_wipe_file(entry.path(), passes, &algo_for_task, emit_progress) {
+                    match secure_wipe_file_cancellable(entry.path(), passes, &algo_for_task, &cancelled, emit_progress) {
                         Ok(_) => total_files += 1,
                         Err(e) => failed_files.push(format!("Failed to wipe {}: {}", entry.path().display(), e)),
                     }
                 }
 
-                if let Err(e) = fs::remove_dir_all(path) {
-                    failed_files.push(format!("Failed to remove directory {}: {}", path_str, e));
-                }
+                failed_files.extend(safety::remove_empty_tree(path));
+            } else {
+                failed_files.push(format!("Not a regular file or directory: {}", path_str));
             }
         }
 
@@ -890,8 +1027,9 @@ async fn wipe_files<R: Runtime>(
             Ok(result)
         }
     })
-    .await
-    .map_err(|e| format!("wipe_files task join error: {}", e))?;
+    .await;
+    listener_handle.unlisten(cancel_listener);
+    let join_result = join_result.map_err(|e| format!("wipe_files task join error: {}", e))?;
 
     join_result
 }
@@ -908,9 +1046,11 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _| {
-            handle_context_invocation(&app.app_handle(), &argv);
+            handle_context_invocation(app.app_handle(), &argv);
         }))
         .invoke_handler(tauri::generate_handler![
+            get_file_size,
+            show_size_warning_dialog,
             validate_drive_path,
             show_confirmation_dialog,
             execute_free_space_wipe,
@@ -924,8 +1064,8 @@ fn main() {
             platform_info
         ])
         .setup(move |app| {
-            handle_context_invocation(&app.app_handle(), &initial_args);
-            ui::init_ui(&app.app_handle(), launch_hidden)?;
+            handle_context_invocation(app.app_handle(), &initial_args);
+            ui::init_ui(app.app_handle(), launch_hidden)?;
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -935,19 +1075,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::context_menu::{collect_context_paths, sanitize_context_paths};
+    #[cfg(windows)]
+    use crate::platform::context_menu::{
+        disable_context_menu, enable_context_menu, is_context_menu_enabled,
+    };
     use std::fs::{self, File};
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
     use std::thread;
     use std::time::Duration;
-    use crate::platform::context_menu::{
-        collect_context_paths,
-        sanitize_context_paths,
-        enable_context_menu,
-        disable_context_menu,
-        is_context_menu_enabled,
-    };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn get_unique_id() -> u128 {
         thread::sleep(Duration::from_millis(10)); // Ensure unique timestamps
@@ -971,38 +1109,39 @@ mod tests {
         let unique_id = get_unique_id();
         let file_path = dir.join(format!("test_file_{}", unique_id));
         println!("Creating test file at: {:?}", file_path);
-        
+
         // Create parent directory if it doesn't exist
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent)?;
             // Add a small delay to ensure directory is fully created
             thread::sleep(Duration::from_millis(50));
         }
-        
+
         let mut file = File::create(&file_path)?;
         file.write_all(content)?;
         file.sync_all()?;
-        
+
         // Add a small delay to ensure file is fully written
         thread::sleep(Duration::from_millis(50));
-        
+
         // Verify file was created
         if !file_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to verify file creation at {:?}", file_path)
-            ));
+            return Err(io::Error::other(format!(
+                "Failed to verify file creation at {:?}",
+                file_path
+            )));
         }
-        
+
         // Verify file size
         let metadata = fs::metadata(&file_path)?;
         if metadata.len() != content.len() as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("File size mismatch. Expected {} bytes, got {} bytes", content.len(), metadata.len())
-            ));
+            return Err(io::Error::other(format!(
+                "File size mismatch. Expected {} bytes, got {} bytes",
+                content.len(),
+                metadata.len()
+            )));
         }
-        
+
         println!("Successfully created test file: {:?}", file_path);
         Ok(file_path)
     }
@@ -1018,27 +1157,20 @@ mod tests {
         ];
 
         let collected = collect_context_paths(&args);
-        assert_eq!(collected, vec![
-            "C:/example/file1.txt".to_string(),
-            "D:/second.bin".to_string(),
-        ]);
+        assert_eq!(
+            collected,
+            vec![
+                "C:/example/file1.txt".to_string(),
+                "D:/second.bin".to_string(),
+            ]
+        );
     }
 
     #[test]
-    fn collect_context_paths_splits_multi_value_argument() {
-        let args = vec![
-            "BitBurn.exe".to_string(),
-            "--context-wipe".to_string(),
-            "C:/one.txt|D:/two.txt;E:/three.txt\nF:/four.txt".to_string(),
-        ];
-
-        let collected = collect_context_paths(&args);
-        assert_eq!(collected, vec![
-            "C:/one.txt".to_string(),
-            "D:/two.txt".to_string(),
-            "E:/three.txt".to_string(),
-            "F:/four.txt".to_string(),
-        ]);
+    fn collect_context_paths_preserves_filename_delimiters() {
+        let path = "C:/one;two.txt".to_string();
+        let args = vec!["BitBurn.exe".into(), "--context-wipe".into(), path.clone()];
+        assert_eq!(collect_context_paths(&args), vec![path]);
     }
 
     #[test]
@@ -1061,10 +1193,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn enable_disable_context_menu_respects_override_root() {
-        let temp_root = format!(
-            "Software\\Classes\\BitBurnTest_{}",
-            get_unique_id()
-        );
+        let temp_root = format!("Software\\Classes\\BitBurnTest_{}", get_unique_id());
         std::env::set_var("BITBURN_CONTEXT_ROOT", &temp_root);
 
         let dummy_exe = PathBuf::from("C:/BitBurn/BitBurn.exe");
@@ -1105,7 +1234,10 @@ mod tests {
         // Sleep briefly to ensure file handles are released
         thread::sleep(Duration::from_millis(50));
         if let Err(e) = fs::remove_dir_all(dir) {
-            println!("Warning: Failed to clean up test directory: {:?} - {}", dir, e);
+            println!(
+                "Warning: Failed to clean up test directory: {:?} - {}",
+                dir, e
+            );
         }
     }
 
@@ -1113,9 +1245,115 @@ mod tests {
     fn test_nonexistent_file() {
         let dir = std::env::temp_dir();
         let file_path = dir.join("nonexistent_test_file");
-        
+
         let result = secure_wipe_file(&file_path, 1, &WipeAlgorithm::NistClear, |_| {});
         assert!(matches!(result, Err(WipeError::PathNotFound)));
+    }
+
+    #[test]
+    fn gutmann_bytes_match_patterns_across_buffer_boundary() {
+        use std::io::Read;
+        let mut file = tempfile::tempfile().unwrap();
+        file.set_len(1024 * 1024 + 16).unwrap();
+        let mut observer = file.try_clone().unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut checked = 0;
+        let result = overwrite_file(
+            &mut file,
+            35,
+            &WipeAlgorithm::Gutmann,
+            &cancelled,
+            |progress| {
+                if progress.bytes_processed == 0
+                    && (progress.current_pass == 6 || progress.current_pass == 8)
+                {
+                    observer.seek(SeekFrom::Start(1024 * 1024 - 2)).unwrap();
+                    let mut bytes = [0u8; 8];
+                    observer.read_exact(&mut bytes).unwrap();
+                    if progress.current_pass == 6 {
+                        assert_eq!(bytes, [0x55; 8]);
+                    } else {
+                        let pattern = [0x92, 0x49, 0x24];
+                        for (index, byte) in bytes.iter().enumerate() {
+                            assert_eq!(*byte, pattern[(1024 * 1024 - 2 + index) % 3]);
+                        }
+                        cancelled.store(true, Ordering::SeqCst);
+                    }
+                    checked += 1;
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(checked, 2);
+    }
+
+    #[test]
+    fn cancellation_during_pass_preserves_file() -> io::Result<()> {
+        let dir = create_test_dir()?;
+        let path = create_test_file(&dir, b"keep me")?;
+        let cancelled = AtomicBool::new(false);
+        let result =
+            secure_wipe_file_cancellable(&path, 3, &WipeAlgorithm::NistPurge, &cancelled, |_| {
+                cancelled.store(true, Ordering::SeqCst);
+            });
+        assert!(
+            matches!(result, Err(WipeError::Io(ref e)) if e.kind() == io::ErrorKind::Interrupted)
+        );
+        assert_eq!(fs::read(&path)?, b"keep me");
+        cleanup_test_dir(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_cannot_redirect_wipe() -> io::Result<()> {
+        let dir = create_test_dir()?;
+        let real = dir.join("real");
+        fs::create_dir(&real)?;
+        let file = create_test_file(&real, b"keep me")?;
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link)?;
+        let result = secure_wipe_file(
+            &link.join(file.file_name().unwrap()),
+            1,
+            &WipeAlgorithm::NistClear,
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&file)?, b"keep me");
+        cleanup_test_dir(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlink_cannot_destroy_unselected_file() -> io::Result<()> {
+        let dir = create_test_dir()?;
+        let original = create_test_file(&dir, b"keep me")?;
+        let link = dir.join("hardlink");
+        fs::hard_link(&original, &link)?;
+        assert!(secure_wipe_file(&link, 1, &WipeAlgorithm::NistClear, |_| {}).is_err());
+        assert_eq!(fs::read(&original)?, b"keep me");
+        cleanup_test_dir(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn excessive_passes_leave_file_untouched() -> io::Result<()> {
+        let dir = create_test_dir()?;
+        let path = create_test_file(&dir, b"keep me")?;
+        let result = secure_wipe_file(&path, 36, &WipeAlgorithm::Random, |_| {});
+        assert!(matches!(result, Err(WipeError::InvalidPasses)));
+        assert_eq!(fs::read(&path)?, b"keep me");
+        cleanup_test_dir(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_file_progress_is_finite() {
+        let mut progress = WipeProgress::new(1, 0, "Random");
+        progress.update(0, "done");
+        assert!(progress.percentage.is_finite());
     }
 
     #[test]
@@ -1123,10 +1361,10 @@ mod tests {
         let test_dir = create_test_dir()?;
         let test_data = [0xAA; 1024];
         let file_path = create_test_file(&test_dir, &test_data)?;
-        
+
         let result = secure_wipe_file(&file_path, 0, &WipeAlgorithm::Random, |_| {});
         assert!(matches!(result, Err(WipeError::InvalidPasses)));
-        
+
         cleanup_test_dir(&test_dir);
         Ok(())
     }
@@ -1136,29 +1374,36 @@ mod tests {
         let test_dir = create_test_dir()?;
         let test_data = [0xAA; 1024];
         let file_path = create_test_file(&test_dir, &test_data)?;
-        
+
         // Verify file exists and has correct size
         let metadata = fs::metadata(&file_path)?;
         assert!(metadata.is_file(), "Created path should be a file");
         assert_eq!(metadata.len(), 1024, "File should be 1024 bytes");
-        
+
         let mut progress_patterns_seen = Vec::new();
         let result = secure_wipe_file(&file_path, 1, &WipeAlgorithm::NistClear, |progress| {
             progress_patterns_seen.push(progress.current_pattern.clone());
         });
-        
+
         // Verify the operation succeeded
-        assert!(result.is_ok(), "Wipe operation should succeed: {:?}", result);
-        
+        assert!(
+            result.is_ok(),
+            "Wipe operation should succeed: {:?}",
+            result
+        );
+
         // Verify progress messages contain "NIST Clear"
         for pattern in &progress_patterns_seen {
-            assert!(pattern.contains("NIST 800-88 Clear"), 
-                "Progress pattern should mention NIST Clear: {}", pattern);
+            assert!(
+                pattern.contains("Single-pass overwrite"),
+                "Progress pattern should mention NIST Clear: {}",
+                pattern
+            );
         }
-        
+
         // Verify file is deleted
         assert!(!file_path.exists(), "File should be deleted after wiping");
-        
+
         cleanup_test_dir(&test_dir);
         Ok(())
     }
@@ -1168,37 +1413,56 @@ mod tests {
         let test_dir = create_test_dir()?;
         let test_data = [0xAA; 1024];
         let file_path = create_test_file(&test_dir, &test_data)?;
-        
+
         // Verify file exists and has correct size
         let metadata = fs::metadata(&file_path)?;
         assert!(metadata.is_file(), "Created path should be a file");
         assert_eq!(metadata.len(), 1024, "File should be 1024 bytes");
-        
+
         let mut progress_patterns_seen = Vec::new();
         let result = secure_wipe_file(&file_path, 3, &WipeAlgorithm::NistPurge, |progress| {
             progress_patterns_seen.push(progress.current_pattern.clone());
         });
-        
+
         // Verify the operation succeeded
-        assert!(result.is_ok(), "Wipe operation should succeed: {:?}", result);
-        
+        assert!(
+            result.is_ok(),
+            "Wipe operation should succeed: {:?}",
+            result
+        );
+
         // Verify progress messages contain "NIST Purge"
         for pattern in &progress_patterns_seen {
-            assert!(pattern.contains("NIST 800-88 Purge"), 
-                "Progress pattern should mention NIST Purge: {}", pattern);
+            assert!(
+                pattern.contains("Three-pass overwrite"),
+                "Progress pattern should mention NIST Purge: {}",
+                pattern
+            );
         }
-        
+
         // Verify we saw all 3 passes
-        assert!(progress_patterns_seen.iter().any(|p| p.contains("Pass 1/3")), 
-            "Missing first pass");
-        assert!(progress_patterns_seen.iter().any(|p| p.contains("Pass 2/3")), 
-            "Missing second pass");
-        assert!(progress_patterns_seen.iter().any(|p| p.contains("Pass 3/3")), 
-            "Missing third pass");
-        
+        assert!(
+            progress_patterns_seen
+                .iter()
+                .any(|p| p.contains("Pass 1/3")),
+            "Missing first pass"
+        );
+        assert!(
+            progress_patterns_seen
+                .iter()
+                .any(|p| p.contains("Pass 2/3")),
+            "Missing second pass"
+        );
+        assert!(
+            progress_patterns_seen
+                .iter()
+                .any(|p| p.contains("Pass 3/3")),
+            "Missing third pass"
+        );
+
         // Verify file is deleted
         assert!(!file_path.exists(), "File should be deleted after wiping");
-        
+
         cleanup_test_dir(&test_dir);
         Ok(())
     }
@@ -1206,13 +1470,14 @@ mod tests {
     #[test]
     fn test_gutmann_wipe() -> io::Result<()> {
         let test_dir = create_test_dir()?;
-        let test_data = [0xAA; 4096];  // Larger file for pattern testing
+        let test_data = [0xAA; 4096]; // Larger file for pattern testing
         let file_path = create_test_file(&test_dir, &test_data)?;
-        
+
         let mut progress_patterns_seen = Vec::new();
         let result = secure_wipe_file(&file_path, 35, &WipeAlgorithm::Gutmann, |progress| {
             // Only store the base pattern without MB information
-            let base_pattern = progress.current_pattern
+            let base_pattern = progress
+                .current_pattern
                 .split(" - ")
                 .next()
                 .unwrap_or(&progress.current_pattern)
@@ -1221,43 +1486,63 @@ mod tests {
                 progress_patterns_seen.push(base_pattern);
             }
         });
-        
+
         // Verify the operation succeeded
         assert!(result.is_ok(), "Wipe operation failed: {:?}", result);
-        
+
         // Verify we saw all 35 passes
-        let unique_passes = progress_patterns_seen.iter()
+        let unique_passes = progress_patterns_seen
+            .iter()
             .filter(|p| p.contains("Pass") || p.contains("Pattern"))
             .filter(|p| !p.contains("Finalizing"))
             .count();
         assert_eq!(unique_passes, 35, "Did not see all 35 passes");
-            
+
         // Verify the sequence of passes
-        let pass_sequence = progress_patterns_seen.iter()
+        let pass_sequence = progress_patterns_seen
+            .iter()
             .map(|p| p.as_str())
             .collect::<Vec<_>>();
-            
+
         // Verify first 4 passes are random
         for i in 0..4 {
-            assert!(pass_sequence.iter().any(|&p| p.contains(&format!("Random data (Pass {}/35)", i + 1))),
-                "Missing random pass {}", i + 1);
+            assert!(
+                pass_sequence
+                    .iter()
+                    .any(|&p| p.contains(&format!("Random data (Pass {}/35)", i + 1))),
+                "Missing random pass {}",
+                i + 1
+            );
         }
-        
+
         // Verify some key fixed patterns are present
-        assert!(pass_sequence.iter().any(|&p| p.contains("Pattern 5/35: 0x55 0xAA")),
-            "Missing alternating pattern 0x55 0xAA");
-        assert!(pass_sequence.iter().any(|&p| p.contains("Pattern 7/35: 0x92 0x49 0x24")),
-            "Missing pattern 0x92 0x49 0x24");
-            
+        assert!(
+            pass_sequence
+                .iter()
+                .any(|&p| p.contains("Pattern 5/35: 0x55")),
+            "Missing alternating pattern 0x55 0xAA"
+        );
+        assert!(
+            pass_sequence
+                .iter()
+                .any(|&p| p.contains("Pattern 7/35: 0x92 0x49 0x24")),
+            "Missing pattern 0x92 0x49 0x24"
+        );
+
         // Verify last 4 passes are random
         for i in 32..=35 {
-            assert!(pass_sequence.iter().any(|&p| p.contains(&format!("Random data (Pass {}/35)", i))),
-                "Missing random pass {}", i);
+            assert!(
+                pass_sequence
+                    .iter()
+                    .any(|&p| p.contains(&format!("Random data (Pass {}/35)", i))),
+                "Missing random pass {}",
+                i
+            );
         }
-        
+
         // Verify file is deleted
         assert!(!file_path.exists(), "File should be deleted after wiping");
-        
+
         cleanup_test_dir(&test_dir);
         Ok(())
     }
@@ -1267,13 +1552,14 @@ mod tests {
         let test_dir = create_test_dir()?;
         let test_data = [0xAA; 1024];
         let file_path = create_test_file(&test_dir, &test_data)?;
-        
+
         // Test with 5 passes
         let passes = 5;
         let mut progress_patterns_seen = Vec::new();
         let result = secure_wipe_file(&file_path, passes, &WipeAlgorithm::Random, |progress| {
             // Only store the base pattern without MB information
-            let base_pattern = progress.current_pattern
+            let base_pattern = progress
+                .current_pattern
                 .split(" - ")
                 .next()
                 .unwrap_or(&progress.current_pattern)
@@ -1282,27 +1568,35 @@ mod tests {
                 progress_patterns_seen.push(base_pattern);
             }
         });
-        
+
         // Verify the operation succeeded
-        assert!(result.is_ok(), "Wipe operation should succeed: {:?}", result);
-        
+        assert!(
+            result.is_ok(),
+            "Wipe operation should succeed: {:?}",
+            result
+        );
+
         // Verify we saw all passes
-        let unique_passes = progress_patterns_seen.iter()
+        let unique_passes = progress_patterns_seen
+            .iter()
             .filter(|p| p.contains("Pass"))
             .filter(|p| !p.contains("Finalizing"))
             .count();
         assert_eq!(unique_passes, passes as usize, "Did not see all passes");
-        
+
         // Verify pass numbering
         for i in 1..=passes {
             let pass_pattern = format!("Writing random data (Pass {}/{})", i, passes);
-            assert!(progress_patterns_seen.iter().any(|p| p == &pass_pattern),
-                "Missing pass {}", i);
+            assert!(
+                progress_patterns_seen.iter().any(|p| p == &pass_pattern),
+                "Missing pass {}",
+                i
+            );
         }
-        
+
         // Verify file is deleted
         assert!(!file_path.exists(), "File should be deleted after wiping");
-        
+
         cleanup_test_dir(&test_dir);
         Ok(())
     }
@@ -1310,7 +1604,8 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn platform_info_reports_non_windows() {
-        let info = tauri::async_runtime::block_on(platform_info()).expect("platform_info should succeed");
+        let info =
+            tauri::async_runtime::block_on(platform_info()).expect("platform_info should succeed");
         assert!(!info.is_windows);
         assert_ne!(info.os, "windows");
     }
@@ -1318,7 +1613,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn platform_info_reports_windows() {
-        let info = tauri::async_runtime::block_on(platform_info()).expect("platform_info should succeed");
+        let info =
+            tauri::async_runtime::block_on(platform_info()).expect("platform_info should succeed");
         assert!(info.is_windows);
         assert_eq!(info.os, "windows");
     }

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Window } from "@tauri-apps/api/window";
@@ -37,6 +37,9 @@ function App() {
     "NistClear" | "NistPurge" | "Gutmann" | "Random"
   >("NistPurge");
   const [isWiping, setIsWiping] = useState(false);
+  const busy = useRef(false);
+  const resultTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (resultTimer.current) clearTimeout(resultTimer.current); }, []);
   const [result, setResult] = useState<{
     success: boolean;
     message: string;
@@ -150,6 +153,7 @@ function App() {
         unlistenContext = await window.listen<ContextWipePayload>(
           "context_wipe_request",
           (event: Event<ContextWipePayload>) => {
+            if (busy.current) return;
             const payload = event.payload;
             const unique = Array.from(new Set(payload.paths || []));
 
@@ -226,7 +230,8 @@ function App() {
               if (!confirmed) return;
             }
           } catch (error) {
-            console.error("Error checking file size:", error);
+            showResult(false, `Cannot inspect selected file: ${error}`);
+            return;
           }
         }
 
@@ -286,22 +291,24 @@ function App() {
   const getAlgorithmDescription = () => {
     switch (algorithm) {
       case "NistClear":
-        return "NIST 800-88 Clear method - Single pass with zeros (Quick)";
+        return "Single-pass overwrite method - Single pass with zeros (Quick)";
       case "NistPurge":
-        return "NIST 800-88 Purge method - 3 passes with zeros, ones, and random data (Recommended)";
+        return "Three passes: zeros, ones and random data. This is not device purging.";
       case "Gutmann":
-        return "Peter Gutmann's 35-pass algorithm - Maximum security for magnetic media (Very slow)";
+        return "Peter Gutmann's 35-pass algorithm - Legacy magnetic-media pattern (Very slow)";
       case "Random":
         return `${passes} passes of cryptographically secure random data (Custom)`;
     }
   };
 
   const showResult = (success: boolean, message: string) => {
+    busy.current = false;
     setResult({ success, message });
     setIsWiping(false);
+    if (resultTimer.current) clearTimeout(resultTimer.current);
 
     // Reset UI after 3 seconds
-    setTimeout(() => {
+    resultTimer.current = setTimeout(() => {
       setResult(null);
       setSelectedPaths([]);
       setOperationMode("initial");
@@ -313,7 +320,9 @@ function App() {
   };
 
   const handleWipe = async () => {
-    if (selectedPaths.length === 0) return;
+    if (selectedPaths.length === 0 || busy.current) return;
+    busy.current = true;
+    if (resultTimer.current) clearTimeout(resultTimer.current);
 
     try {
       setIsContextMode(false);
@@ -322,6 +331,9 @@ function App() {
 
       const confirmed = await invoke("show_confirmation_dialog", {
         path: selectedPaths.join("\n"),
+        operation: "files",
+        paths: selectedPaths,
+        passes,
         algorithm,
         description: getAlgorithmDescription(),
       });
@@ -364,6 +376,9 @@ function App() {
   };
 
   const handleWipeFreeSpace = async () => {
+    if (busy.current) return;
+    busy.current = true;
+    if (resultTimer.current) clearTimeout(resultTimer.current);
     try {
       setResult(null);
       setWipeProgress(null);
@@ -396,6 +411,9 @@ function App() {
 
       const confirmed = await invoke("show_confirmation_dialog", {
         path,
+        operation: "freespace",
+        paths: [path],
+        passes,
         algorithm,
         description: getAlgorithmDescription(),
       });
@@ -455,12 +473,10 @@ function App() {
       try {
         const window = new Window("main");
         await window.emit("cancel_operation");
-        setIsWiping(false);
-        setWipeProgress(null);
-        showResult(false, "Operation cancelled by user");
+        setAbortController(null);
       } catch (error) {
         console.error("Error cancelling operation:", error);
-        showResult(false, `Error cancelling operation: ${error}`);
+        setResult({ success: false, message: `Cancellation request failed: ${error}` });
       }
     }
   };
@@ -539,9 +555,9 @@ function App() {
                   className="select select-bordered w-full text-lg text-center"
                   disabled={isWiping}
                 >
-                  <option value="NistClear">NIST 800-88 Clear (Quick)</option>
+                  <option value="NistClear">Single-pass overwrite (Quick)</option>
                   <option value="NistPurge">
-                    NIST 800-88 Purge (Recommended)
+                    Three-pass overwrite (Zeros, ones, random)
                   </option>
                   <option value="Gutmann">Gutmann (Very Slow)</option>
                   <option value="Random">Random Passes (Custom)</option>
@@ -754,8 +770,8 @@ function App() {
                           className="select select-bordered w-full"
                           disabled={isWiping}
                         >
-                          <option value="NistClear">NIST 800-88 Clear (Quick)</option>
-                          <option value="NistPurge">NIST 800-88 Purge (Recommended)</option>
+                          <option value="NistClear">Single-pass overwrite (Quick)</option>
+                          <option value="NistPurge">Three-pass overwrite (Zeros, ones, random)</option>
                           <option value="Gutmann">Gutmann (Very Slow)</option>
                           <option value="Random">Random Passes (Custom)</option>
                         </select>
@@ -908,7 +924,7 @@ function App() {
           <div className="bg-base-300 h-px w-full opacity-30" />
           <div className="bg-base-100 p-4 text-center">
             <p className="text-gray-500 text-sm">
-              ⚠️ Warning: Files erased with BitBurn cannot be recovered
+              ⚠️ Overwriting is destructive. SSDs, snapshots and backups may retain copies.
             </p>
           </div>
         </div>

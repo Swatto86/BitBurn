@@ -8,9 +8,7 @@ use tauri::{
 };
 
 use crate::{
-    get_autostart_status,
-    get_context_menu_status,
-    log_event,
+    get_autostart_status, get_context_menu_status, log_event,
     platform::{
         autostart::{register_autostart, unregister_autostart},
         context_menu::{register_context_menu, unregister_context_menu},
@@ -32,9 +30,8 @@ fn setup_window(app: &AppHandle, launch_hidden: bool) -> tauri::Result<()> {
         let window_clone = window.clone();
         window.on_window_event(move |event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                if window_clone.hide().is_ok() {
-                    api.prevent_close();
-                }
+                api.prevent_close();
+                let _ = window_clone.hide();
             }
         });
 
@@ -130,18 +127,14 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event({
             let toggle_item = toggle_item.clone();
             let autostart_item = autostart_item.clone();
-            move |app, event| {
-            match event.id.as_ref() {
-                "quit" => app.exit(0),
+            move |app, event| match event.id.as_ref() {
+                "quit" if !crate::safety::is_active() => app.exit(0),
                 "toggle_context_menu" => {
                     let app_handle = app.clone();
                     let toggle_item = toggle_item.clone();
                     spawn(async move {
                         let status = get_context_menu_status().await;
-                        let currently_enabled = status
-                            .as_ref()
-                            .map(|s| s.enabled)
-                            .unwrap_or(false);
+                        let currently_enabled = status.as_ref().map(|s| s.enabled).unwrap_or(false);
 
                         if currently_enabled {
                             let result = unregister_context_menu().await;
@@ -205,16 +198,14 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                     let autostart_item = autostart_item.clone();
                     spawn(async move {
                         let status = get_autostart_status().await;
-                        let currently_enabled = status
-                            .as_ref()
-                            .map(|s| s.enabled)
-                            .unwrap_or(false);
+                        let currently_enabled = status.as_ref().map(|s| s.enabled).unwrap_or(false);
 
                         if currently_enabled {
                             let result = unregister_autostart().await;
                             match result {
                                 Ok(res) => {
-                                    let _ = autostart_item.set_text("Enable Autostart with Windows");
+                                    let _ =
+                                        autostart_item.set_text("Enable Autostart with Windows");
                                     log_event(
                                         "autostart_unregister",
                                         json!({"status": res.success, "message": res.message}),
@@ -241,7 +232,8 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                             let result = register_autostart().await;
                             match result {
                                 Ok(res) => {
-                                    let _ = autostart_item.set_text("Disable Autostart with Windows");
+                                    let _ =
+                                        autostart_item.set_text("Disable Autostart with Windows");
                                     log_event(
                                         "autostart_register",
                                         json!({"status": res.success, "message": res.message}),
@@ -269,7 +261,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 }
                 _ => {}
             }
-        }
         })
         .on_tray_icon_event(|tray, event| {
             if let TrayIconEvent::Click {

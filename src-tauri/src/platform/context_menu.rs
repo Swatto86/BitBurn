@@ -1,8 +1,12 @@
+#[cfg(windows)]
 use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager};
+#[cfg(windows)]
 use thiserror::Error;
 
 /// Payload delivered to the frontend when a context-menu wipe is invoked.
@@ -13,6 +17,7 @@ pub struct ContextWipePayload {
     pub source: String,
 }
 
+#[cfg(windows)]
 #[derive(Debug, Error)]
 pub enum ContextMenuError {
     #[cfg(not(windows))]
@@ -26,12 +31,15 @@ pub enum ContextMenuError {
 }
 
 #[cfg(windows)]
-use winreg::{enums::{HKEY_CURRENT_USER, KEY_READ}, RegKey};
+use winreg::{
+    enums::{HKEY_CURRENT_USER, KEY_READ},
+    RegKey,
+};
 
 #[cfg(windows)]
 fn context_menu_keys() -> (String, String) {
-    let base = std::env::var("BITBURN_CONTEXT_ROOT")
-        .unwrap_or_else(|_| "Software\\Classes".to_string());
+    let base =
+        std::env::var("BITBURN_CONTEXT_ROOT").unwrap_or_else(|_| "Software\\Classes".to_string());
     let file_key = format!("{}\\*\\shell\\BitBurn", base);
     let folder_key = format!("{}\\Directory\\shell\\BitBurn", base);
     (file_key, folder_key)
@@ -90,26 +98,10 @@ pub fn is_context_menu_enabled() -> Result<bool, ContextMenuError> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (file_key, folder_key) = context_menu_keys();
     Ok(hkcu.open_subkey_with_flags(file_key, KEY_READ).is_ok()
-        && hkcu
-            .open_subkey_with_flags(folder_key, KEY_READ)
-            .is_ok())
+        && hkcu.open_subkey_with_flags(folder_key, KEY_READ).is_ok())
 }
 
-#[cfg(not(windows))]
-pub fn enable_context_menu(_: &Path) -> Result<(), ContextMenuError> {
-    Err(ContextMenuError::UnsupportedPlatform)
-}
-
-#[cfg(not(windows))]
-pub fn disable_context_menu() -> Result<(), ContextMenuError> {
-    Err(ContextMenuError::UnsupportedPlatform)
-}
-
-#[cfg(not(windows))]
-pub fn is_context_menu_enabled() -> Result<bool, ContextMenuError> {
-    Err(ContextMenuError::UnsupportedPlatform)
-}
-
+#[cfg(windows)]
 pub fn resolve_executable_path() -> Result<PathBuf, ContextMenuError> {
     std::env::current_exe()
         .map_err(|_| ContextMenuError::MissingExecutablePath)
@@ -124,14 +116,8 @@ pub(crate) fn collect_context_paths(args: &[String]) -> Vec<String> {
                 continue;
             }
 
-            // Windows `%V` may deliver multiple selections in a single argument
-            // separated by newlines, pipes, or semicolons. Split generously.
-            for part in entry
-                .split(|c| c == '|' || c == '\n' || c == '\r' || c == ';')
-                .filter(|s| !s.is_empty())
-            {
-                results.push(part.to_string());
-            }
+            // Each OS argument is one path. Delimiters can be legal filename characters.
+            results.push(entry.clone());
         }
     }
     results
@@ -143,7 +129,7 @@ pub(crate) fn sanitize_context_paths(raw_paths: Vec<String>) -> ContextWipePaylo
     let mut invalid = Vec::new();
 
     for raw in raw_paths {
-        let trimmed = raw.trim();
+        let trimmed = raw.as_str();
         if trimmed.is_empty() {
             continue;
         }
@@ -221,12 +207,13 @@ pub fn handle_context_invocation(app: &AppHandle, argv: &[String]) {
     dispatch_context_wipe(app, payload);
 }
 
-pub fn process_cli_side_effects<F>(argv: &[String], mut log_event: F) -> Option<i32>
+pub fn process_cli_side_effects<F>(argv: &[String], log_event: F) -> Option<i32>
 where
     F: FnMut(&str, serde_json::Value),
 {
     #[cfg(windows)]
     {
+        let mut log_event = log_event;
         if argv.iter().any(|a| a == "--register-context-menu") {
             let status = resolve_executable_path()
                 .and_then(|exe| enable_context_menu(&exe))
@@ -236,7 +223,10 @@ where
                     0
                 })
                 .unwrap_or_else(|e| {
-                    log_event("context_menu_register_cli", json!({"status": "error", "message": e.to_string()}));
+                    log_event(
+                        "context_menu_register_cli",
+                        json!({"status": "error", "message": e.to_string()}),
+                    );
                     eprintln!("Failed to register context menu: {}", e);
                     1
                 });
@@ -251,7 +241,10 @@ where
                     0
                 })
                 .unwrap_or_else(|e| {
-                    log_event("context_menu_unregister_cli", json!({"status": "error", "message": e.to_string()}));
+                    log_event(
+                        "context_menu_unregister_cli",
+                        json!({"status": "error", "message": e.to_string()}),
+                    );
                     eprintln!("Failed to remove context menu: {}", e);
                     1
                 });
@@ -274,7 +267,8 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn register_context_menu_is_unavailable_on_non_windows() {
-        let result = tauri::async_runtime::block_on(super::register_context_menu()).expect("command should return result");
+        let result = tauri::async_runtime::block_on(super::register_context_menu())
+            .expect("command should return result");
         assert!(!result.success);
         assert!(result.message.contains("not available"));
     }
@@ -282,7 +276,8 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn unregister_context_menu_is_unavailable_on_non_windows() {
-        let result = tauri::async_runtime::block_on(super::unregister_context_menu()).expect("command should return result");
+        let result = tauri::async_runtime::block_on(super::unregister_context_menu())
+            .expect("command should return result");
         assert!(!result.success);
         assert!(result.message.contains("not available"));
     }
@@ -290,7 +285,8 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn get_context_menu_status_is_unavailable_on_non_windows() {
-        let status = tauri::async_runtime::block_on(super::get_context_menu_status()).expect("command should return result");
+        let status = tauri::async_runtime::block_on(super::get_context_menu_status())
+            .expect("command should return result");
         assert!(!status.enabled);
         assert!(status.message.contains("not available"));
     }

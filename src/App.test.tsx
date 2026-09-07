@@ -13,17 +13,11 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 }));
 
 vi.mock("@tauri-apps/api/window", () => {
-  // Create a mock Window class that can be instantiated
+  const getCurrent = vi.fn();
   class MockWindow {
-    listen = vi.fn(() => Promise.resolve(() => {}));
-    emit = vi.fn();
-    onDragDropEvent = vi.fn(() => Promise.resolve(() => {}));
+    constructor() { return getCurrent(); }
   }
-
-  return {
-    Window: MockWindow,
-    getCurrent: vi.fn(() => new MockWindow()),
-  };
+  return { Window: MockWindow, getCurrent };
 });
 
 // Import the mocked modules
@@ -39,6 +33,8 @@ const mockGetCurrent = vi.mocked(getCurrent);
 describe("BitBurn UI Tests", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockInvoke.mockReset();
+    mockOpen.mockReset();
     localStorage.clear();
 
     // Setup default mocks
@@ -84,16 +80,16 @@ describe("BitBurn UI Tests", () => {
 
       // Use getByRole to avoid matching description text
       expect(
-        screen.getByRole("option", { name: /NIST 800-88 Clear/i }),
+        screen.getByRole("option", { name: /Single-pass overwrite/i }),
       ).toBeInTheDocument();
       expect(
-        screen.getByRole("option", { name: /NIST 800-88 Purge/i }),
+        screen.getByRole("option", { name: /Three-pass overwrite/i }),
       ).toBeInTheDocument();
       expect(
         screen.getByRole("option", { name: /Gutmann/i }),
       ).toBeInTheDocument();
       expect(
-        screen.getByRole("option", { name: /Random/i }),
+        screen.getByRole("option", { name: /^Random Passes/i }),
       ).toBeInTheDocument();
     });
 
@@ -114,7 +110,7 @@ describe("BitBurn UI Tests", () => {
       render(<App />);
 
       expect(
-        screen.getByText(/Files erased with BitBurn cannot be recovered/i),
+        screen.getByText(/SSDs, snapshots and backups may retain copies/i),
       ).toBeInTheDocument();
     });
 
@@ -237,7 +233,7 @@ describe("BitBurn UI Tests", () => {
       await userEvent.selectOptions(select, "NistPurge");
       await waitFor(() => {
         expect(
-          screen.getByText(/3 passes with zeros, ones, and random data/i),
+          screen.getByText(/Three passes: zeros, ones and random data/i),
         ).toBeInTheDocument();
       });
     });
@@ -319,7 +315,7 @@ describe("BitBurn UI Tests", () => {
       await userEvent.click(filesButton);
 
       await waitFor(() => {
-        expect(screen.getByText(/Back/i)).toBeInTheDocument();
+        expect(screen.getByRole("button", { name: /Back to Operation Selection/i })).toBeInTheDocument();
       });
     });
 
@@ -340,7 +336,7 @@ describe("BitBurn UI Tests", () => {
       const filesButton = screen.getByText("Wipe Files/Folders");
       await userEvent.click(filesButton);
 
-      const backButton = await screen.findByText(/Back/i);
+      const backButton = await screen.findByRole("button", { name: /Back to Operation Selection/i });
       await userEvent.click(backButton);
 
       await waitFor(() => {
@@ -532,6 +528,7 @@ describe("BitBurn UI Tests", () => {
       });
 
       // Simulate drag enter event via Tauri API
+      expect(dragEventCallback).toBeTypeOf("function");
       if (dragEventCallback) {
         dragEventCallback({ payload: { type: "enter" } });
       }
@@ -562,6 +559,7 @@ describe("BitBurn UI Tests", () => {
       await userEvent.click(filesButton);
 
       // Simulate drag enter then leave
+      expect(dragEventCallback).toBeTypeOf("function");
       if (dragEventCallback) {
         await dragEventCallback({ payload: { type: "enter" } });
         await dragEventCallback({ payload: { type: "leave" } });
@@ -714,6 +712,7 @@ describe("BitBurn UI Tests", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       // Trigger progress to display cancel button if callback is set
+      expect(progressCallback).toBeTypeOf("function");
       if (progressCallback) {
         await waitFor(() => {
           progressCallback({
@@ -803,6 +802,7 @@ describe("BitBurn UI Tests", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       // Simulate progress event if callback is set
+      expect(progressCallback).toBeTypeOf("function");
       if (progressCallback) {
         await waitFor(() => {
           progressCallback({
@@ -995,6 +995,7 @@ describe("BitBurn UI Tests", () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       // Trigger progress to display cancel button if callback is set
+      expect(progressCallback).toBeTypeOf("function");
       if (progressCallback) {
         await waitFor(() => {
           progressCallback({
@@ -1015,6 +1016,10 @@ describe("BitBurn UI Tests", () => {
           expect(screen.getByText("Cancel Operation")).toBeInTheDocument();
         });
       }
+
+      await userEvent.click(screen.getByText("Cancel Operation"));
+      expect(screen.getByText("Cancel Operation")).toBeDisabled();
+      expect(screen.queryByText("Operation cancelled by user")).not.toBeInTheDocument();
 
       // Clean up
       await waitFor(() => {
@@ -1050,7 +1055,7 @@ describe("BitBurn UI Tests", () => {
       expect(screen.getByText(/wipe algorithm/i)).toBeInTheDocument();
       expect(screen.getByText(/number of passes/i)).toBeInTheDocument();
       expect(
-        screen.getByText(/Files erased with BitBurn cannot be recovered/i),
+        screen.getByText(/SSDs, snapshots and backups may retain copies/i),
       ).toBeInTheDocument();
     });
 
