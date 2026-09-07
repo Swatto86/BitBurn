@@ -12,4 +12,4 @@
 - Replace misleading NIST Purge and unrecoverability claims with accurate overwrite descriptions.
 - Update vulnerable JavaScript dependencies and add real desktop acceptance coverage.
 
-Distribution: Windows installers and a standalone executable. The standalone executable requires Microsoft WebView2 to be installed; it is not a self-contained runtime bundle.
+Distribution: Windows installers and a standalone executable. The standalone executable requires the [Microsoft WebView2 Evergreen Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) to be installed (install it and retry if the app reports a missing runtime or does not open); it is not a self-contained runtime bundle.

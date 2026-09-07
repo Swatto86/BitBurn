@@ -4,6 +4,13 @@ BitBurn is a modern, secure file and drive wiping utility built with Rust and Ta
 
 ![BitBurn Logo](./src-tauri/icons/128x128.png)
 
+## Windows portable download
+
+Run the portable EXE without installing BitBurn. It requires the Microsoft Edge WebView2
+Evergreen Runtime, usually already installed on Windows. If BitBurn does not open or
+reports a missing runtime, install the [WebView2 Evergreen Runtime](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)
+for your architecture and retry. The portable download does not bundle this runtime.
+
 ## Features
 
 - **Multiple Wiping Algorithms:**

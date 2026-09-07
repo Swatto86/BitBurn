@@ -11,7 +11,7 @@ const binary = resolve(process.env.BITBURN_TEST_BINARY ?? `src-tauri/target/debu
 await stat(binary);
 const webviewProfile = process.env.BITBURN_E2E_WEBVIEW_PROFILE ?? join(root, 'webview');
 const env = { ...process.env, WEBKIT_DISABLE_DMABUF_RENDERER: '1', GDK_BACKEND: 'x11', XDG_CONFIG_HOME: join(root, 'config'), XDG_DATA_HOME: join(root, 'data'), XDG_CACHE_HOME: join(root, 'cache'), WEBVIEW2_USER_DATA_FOLDER: webviewProfile };
-const driver = spawn('tauri-driver', ['--port', '4445', '--native-port', '4446'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+const driver = spawn('tauri-driver', ['--port', '4445', '--native-port', '4446', ...(windows ? ['--native-driver', resolve('e2e/msedgedriver-debug.cmd')] : [])], { env, stdio: ['ignore', 'pipe', 'pipe'] });
 let logs = '';
 driver.stdout.on('data', data => { logs += data; });
 driver.stderr.on('data', data => { logs += data; });
@@ -23,7 +23,7 @@ try {
     if (driver.exitCode !== null || i === 100) throw new Error(`Driver did not start: ${logs}`);
     await delay(100);
   }
-  const connect = () => remote({ hostname: '127.0.0.1', port: 4445, logLevel: 'error', connectionRetryCount: 0, connectionRetryTimeout: 20000, capabilities: { 'wdio:enforceWebDriverClassic': true, 'tauri:options': { application: binary, ...(windows ? { webviewOptions: { userDataFolder: webviewProfile } } : {}) } } });
+  const connect = () => remote({ hostname: '127.0.0.1', port: 4445, logLevel: 'error', connectionRetryCount: 0, connectionRetryTimeout: windows ? 65000 : 20000, capabilities: { 'wdio:enforceWebDriverClassic': true, 'tauri:options': { application: binary, ...(windows ? { webviewOptions: { userDataFolder: webviewProfile } } : {}) } } });
   browser = await connect();
   await browser.waitUntil(async () => (await browser.$('h1').getText()) === 'BitBurn', { timeout: 20000 });
   const invoke = (command, args) => browser.executeAsync((command, args, done) => {
