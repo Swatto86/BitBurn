@@ -106,10 +106,10 @@ pub async fn register_autostart() -> Result<crate::WipeResult, String> {
         write_autostart(&exe_path).map_err(|e| e.to_string())?;
         crate::log_event("autostart_register", json!({"status": "success"}));
 
-        return Ok(crate::WipeResult {
+        Ok(crate::WipeResult {
             success: true,
             message: "Autostart enabled".to_string(),
-        });
+        })
     }
 
     #[cfg(not(windows))]
@@ -129,10 +129,10 @@ pub async fn unregister_autostart() -> Result<crate::WipeResult, String> {
         remove_autostart().map_err(|e| e.to_string())?;
         crate::log_event("autostart_unregister", json!({"status": "success"}));
 
-        return Ok(crate::WipeResult {
+        Ok(crate::WipeResult {
             success: true,
             message: "Autostart disabled".to_string(),
-        });
+        })
     }
 
     #[cfg(not(windows))]
@@ -156,7 +156,7 @@ pub async fn get_autostart_status() -> Result<crate::AutostartStatus, String> {
             "Autostart is disabled".to_string()
         };
 
-        return Ok(crate::AutostartStatus { enabled, message });
+        Ok(crate::AutostartStatus { enabled, message })
     }
 
     #[cfg(not(windows))]

@@ -31,7 +31,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf webkit2gtk-driver xvfb xdotool
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf webkit2gtk-driver xvfb xdotool dbus-x11 at-spi2-core
       - run: npm ci
       - run: cargo install tauri-driver --locked
       - run: cargo install cargo-audit --locked
@@ -46,7 +46,7 @@ jobs:
           $PWD.Path >> $env:GITHUB_PATH
       - name: Full Linux gate
         if: runner.os == 'Linux'
-        run: xvfb-run -a bash scripts/verify.sh
+        run: dbus-run-session -- xvfb-run -a bash scripts/verify.sh
       - name: Windows Rust formatting
         if: runner.os == 'Windows'
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --check

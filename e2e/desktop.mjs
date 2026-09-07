@@ -80,6 +80,10 @@ try {
     console.error('Windows:', await browser.getWindowHandles());
     await writeFile(resolve('e2e-failure.html'), await browser.getPageSource());
   }
+  if (!windows) {
+    console.error(execFileSync('ps', ['-eo', 'pid,ppid,stat,comm'], { encoding: 'utf8' }));
+    try { console.error(execFileSync('xdotool', ['search', '--onlyvisible', '--name', '.*'], { encoding: 'utf8' })); } catch (diagnosticError) { console.error(String(diagnosticError)); }
+  }
   console.error(logs);
   throw error;
 } finally {

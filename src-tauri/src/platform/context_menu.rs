@@ -301,10 +301,10 @@ pub async fn register_context_menu() -> Result<crate::WipeResult, String> {
         enable_context_menu(&exe_path).map_err(|e| e.to_string())?;
         crate::log_event("context_menu_register", json!({"status": "success"}));
 
-        return Ok(crate::WipeResult {
+        Ok(crate::WipeResult {
             success: true,
             message: "Context menu registered for files and folders".to_string(),
-        });
+        })
     }
 
     #[cfg(not(windows))]
@@ -324,10 +324,10 @@ pub async fn unregister_context_menu() -> Result<crate::WipeResult, String> {
         disable_context_menu().map_err(|e| e.to_string())?;
         crate::log_event("context_menu_unregister", json!({"status": "success"}));
 
-        return Ok(crate::WipeResult {
+        Ok(crate::WipeResult {
             success: true,
             message: "Context menu removed".to_string(),
-        });
+        })
     }
 
     #[cfg(not(windows))]
@@ -351,7 +351,7 @@ pub async fn get_context_menu_status() -> Result<crate::ContextMenuStatus, Strin
             "Context menu is not registered".to_string()
         };
 
-        return Ok(crate::ContextMenuStatus { enabled, message });
+        Ok(crate::ContextMenuStatus { enabled, message })
     }
 
     #[cfg(not(windows))]
