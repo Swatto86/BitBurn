@@ -52,7 +52,8 @@ try {
           owner = Number(execFileSync('ps', ['-o', 'ppid=', '-p', String(owner)], { encoding: 'utf8' }).trim());
         }
         assert.equal(owner, driver.pid, 'Refusing a dialog outside the test process tree');
-        execFileSync('xdotool', ['key', '--window', ids[0], 'alt+y']);
+        execFileSync('xdotool', ['windowfocus', '--sync', ids[0]]);
+        execFileSync('xdotool', ['key', '--clearmodifiers', 'alt+y']);
         confirmed = true;
         break;
       } catch { await delay(100); }
