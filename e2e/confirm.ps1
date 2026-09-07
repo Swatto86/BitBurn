@@ -15,11 +15,17 @@ do {
             }
             if ($owner -ne $DriverPid) { continue }
             $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, 'Yes')
-            $button = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-            if ($null -ne $button) {
-                $pattern = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-                $pattern.Invoke()
-                exit 0
+            $buttons = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+            foreach ($button in $buttons) {
+                $pattern = $null
+                if ($button.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+                    $pattern.Invoke()
+                    exit 0
+                }
+                if ($button.TryGetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern, [ref]$pattern)) {
+                    $pattern.DoDefaultAction()
+                    exit 0
+                }
             }
         }
     }

@@ -66,12 +66,15 @@ try {
   await confirmationClick;
   await browser.waitUntil(async () => (await browser.$('body').getText()).includes('Successfully wiped 1 files'), { timeout: 20000 });
   await assert.rejects(stat(file), { code: 'ENOENT' });
-  await browser.execute(() => { localStorage.setItem('theme', 'light'); });
+  await browser.$('button.btn-circle').click();
+  await browser.waitUntil(async () => (await browser.$('html').getAttribute('data-theme')) === 'light', { timeout: 10000 });
+  // WebDriver terminates the browser process; let WebKit commit its asynchronous storage write first.
+  await delay(2000);
   await browser.deleteSession();
   browser = undefined;
   browser = await connect();
   await browser.waitUntil(async () => (await browser.$('h1').getText()) === 'BitBurn', { timeout: 20000 });
-  assert.equal(await browser.$('html').getAttribute('data-theme'), 'light');
+  await browser.waitUntil(async () => (await browser.$('html').getAttribute('data-theme')) === 'light', { timeout: 10000 });
   console.log('PASS: boot, IPC validation, real UI wipe, filesystem deletion, persistence and restart');
   await browser.deleteSession();
   browser = undefined;
